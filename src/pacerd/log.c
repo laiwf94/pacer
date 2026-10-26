@@ -189,3 +189,21 @@ void pd_log_msg(int level, const char *msg)
     pd_log_begin(&l, level, msg);
     pd_log_end(&l);
 }
+
+void pd_log_limit_init(struct pd_log_limit *lim, uint64_t per_sec, uint64_t burst)
+{
+    pacer_rate r = {per_sec, 1000000000ull, burst};
+    /* The rate comes from code, never from config, so it is always valid. */
+    (void)pacer_gcra_init(&lim->gcra, &r);
+    atomic_init(&lim->suppressed, 0);
+}
+
+int pd_log_allow(struct pd_log_limit *lim, uint64_t now_ns, uint64_t *dropped)
+{
+    if (pacer_gcra_take(&lim->gcra, now_ns, 1, NULL) != 1) {
+        atomic_fetch_add_explicit(&lim->suppressed, 1, memory_order_relaxed);
+        return 0;
+    }
+    *dropped = atomic_exchange_explicit(&lim->suppressed, 0, memory_order_relaxed);
+    return 1;
+}

@@ -122,3 +122,19 @@ TEST(log_conn_ids_increase)
     CHECK(a >= 1);
     CHECK_EQ_U64(b, a + 1);
 }
+
+TEST(log_limit_counts_dropped_lines)
+{
+    struct pd_log_limit lim;
+    pd_log_limit_init(&lim, 10, 2);
+    uint64_t dropped = 99;
+    uint64_t t = 1000000000ull;
+    CHECK_EQ_INT(pd_log_allow(&lim, t, &dropped), 1);
+    CHECK_EQ_U64(dropped, 0);
+    CHECK_EQ_INT(pd_log_allow(&lim, t, &dropped), 1);
+    for (int i = 0; i < 5; i++) {
+        CHECK_EQ_INT(pd_log_allow(&lim, t, &dropped), 0);
+    }
+    CHECK_EQ_INT(pd_log_allow(&lim, t + 100000000ull, &dropped), 1);
+    CHECK_EQ_U64(dropped, 5);
+}

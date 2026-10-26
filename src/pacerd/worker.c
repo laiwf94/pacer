@@ -3,12 +3,14 @@
 #include "pacerd/util.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #define MAX_EVENTS      64
 #define ACCEPT_PER_WAKE 32
+#define ACCEPT_PAUSE_NS 100000000ull
 
 static void worker_fatal(struct pd_worker *w, const char *what, int err)
 {
@@ -22,13 +24,36 @@ static void worker_fatal(struct pd_worker *w, const char *what, int err)
     atomic_store(&w->d->failed, 1);
 }
 
-static void stop_accepting(struct pd_worker *w)
+static void listeners_off(struct pd_worker *w)
 {
     for (uint32_t i = 0; i < w->d->nlisteners; i++) {
         /* The listener stays open until every worker has let go of it, so
          * this cannot race with the main thread closing it. */
         (void)epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->d->listeners[i].h.fd, NULL);
     }
+}
+
+static int listeners_on(struct pd_worker *w)
+{
+    for (uint32_t i = 0; i < w->d->nlisteners; i++) {
+        /* EPOLLEXCLUSIVE wakes one worker per new connection instead of
+         * all of them. */
+        struct epoll_event ev = {.events = EPOLLIN | EPOLLEXCLUSIVE,
+                                 .data.ptr = &w->d->listeners[i].h};
+        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->d->listeners[i].h.fd, &ev) != 0 &&
+            errno != EEXIST) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void stop_accepting(struct pd_worker *w)
+{
+    if (!w->accept_paused_to) {
+        listeners_off(w);
+    }
+    w->accept_paused_to = 0;
     w->draining = 1;
     atomic_fetch_add(&w->d->workers_off_listeners, 1);
     pd_wake(w->d->main_wake);
@@ -57,20 +82,64 @@ static void on_wake(struct pd_worker *w)
     }
 }
 
-static void on_listener(struct pd_worker *w, struct pd_listener *l)
+/*
+ * Out of file descriptors. The pending connection stays queued, so the
+ * listener stays readable and a level-triggered loop would spin. Give up
+ * the spare fd, accept the connection and close it at once (the client
+ * sees a clean close instead of a hang), then take the spare back. If the
+ * spare cannot be had, stop accepting for a short while instead.
+ */
+static void shed_connection(struct pd_worker *w, struct pd_listener *l, uint64_t now)
 {
-    for (int i = 0; i < ACCEPT_PER_WAKE; i++) {
+    const char *name = w->cfg->c.listeners[l->index].name;
+    if (w->reserve_fd >= 0) {
+        (void)close(w->reserve_fd);
+        int fd = accept4(l->h.fd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd >= 0) {
+            (void)close(fd);
+            pd_log_reject(l, name, "-", "fd_exhausted", now);
+        }
+        w->reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    }
+    if (w->reserve_fd < 0) {
+        listeners_off(w);
+        w->accept_paused_to = now + ACCEPT_PAUSE_NS;
+        pd_log_reject(l, name, "-", "fd_exhausted_paused", now);
+    }
+}
+
+static void on_listener(struct pd_worker *w, struct pd_listener *l, uint64_t now)
+{
+    for (int i = 0; i < ACCEPT_PER_WAKE && !w->accept_paused_to; i++) {
         struct sockaddr_storage peer;
         socklen_t len = sizeof peer;
         int fd = accept4(l->h.fd, (struct sockaddr *)&peer, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if (fd < 0) {
-            if (errno == EINTR || errno == ECONNABORTED) {
-                continue;
-            }
-            /* EAGAIN: another worker took it, or the queue is empty. */
-            return;
+        if (fd >= 0) {
+            pd_conn_accept(w, l, fd, &peer);
+            continue;
         }
-        pd_conn_accept(w, l->index, fd, &peer);
+        if (errno == EINTR || errno == ECONNABORTED) {
+            continue;
+        }
+        if (errno == EMFILE || errno == ENFILE) {
+            shed_connection(w, l, now);
+        }
+        /* EAGAIN: the queue is empty or another worker got there first. */
+        return;
+    }
+}
+
+static void maybe_resume_accepting(struct pd_worker *w, uint64_t now)
+{
+    if (!w->accept_paused_to || now < w->accept_paused_to) {
+        return;
+    }
+    w->accept_paused_to = 0;
+    if (w->reserve_fd < 0) {
+        w->reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    }
+    if (listeners_on(w) != 0) {
+        worker_fatal(w, "epoll_ctl listener", errno);
     }
 }
 
@@ -85,15 +154,10 @@ static int setup(struct pd_worker *w)
         worker_fatal(w, "epoll_ctl wake", errno);
         return -1;
     }
-    for (uint32_t i = 0; i < w->d->nlisteners; i++) {
-        /* EPOLLEXCLUSIVE wakes one worker per new connection instead of
-         * all of them. */
-        struct epoll_event lev = {.events = EPOLLIN | EPOLLEXCLUSIVE,
-                                  .data.ptr = &w->d->listeners[i].h};
-        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->d->listeners[i].h.fd, &lev) != 0) {
-            worker_fatal(w, "epoll_ctl listener", errno);
-            return -1;
-        }
+    w->reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (listeners_on(w) != 0) {
+        worker_fatal(w, "epoll_ctl listener", errno);
+        return -1;
     }
     return 0;
 }
@@ -101,14 +165,18 @@ static int setup(struct pd_worker *w)
 static int wait_ms(struct pd_worker *w, uint64_t now)
 {
     struct pd_timer *t = pd_heap_peek(&w->timers);
-    if (!t) {
+    uint64_t next = t ? t->deadline : UINT64_MAX;
+    if (w->accept_paused_to && w->accept_paused_to < next) {
+        next = w->accept_paused_to;
+    }
+    if (next == UINT64_MAX) {
         return -1;
     }
-    if (t->deadline <= now) {
+    if (next <= now) {
         return 0;
     }
     /* Round up so the loop never wakes just before a deadline. */
-    uint64_t ms = (t->deadline - now + 999999) / 1000000;
+    uint64_t ms = (next - now + 999999) / 1000000;
     return ms > 60000 ? 60000 : (int)ms;
 }
 
@@ -142,7 +210,7 @@ void *pd_worker_main(void *arg)
                     break;
                 case PD_H_LISTENER:
                     if (!w->draining) {
-                        on_listener(w, (struct pd_listener *)h);
+                        on_listener(w, (struct pd_listener *)h, now);
                     }
                     break;
                 default:
@@ -151,11 +219,15 @@ void *pd_worker_main(void *arg)
                 }
             }
             run_timers(w, now);
+            maybe_resume_accepting(w, now);
             pd_conn_reap(w);
         }
     }
     close_all(w, "shutdown");
     pd_conn_reap(w);
+    if (w->reserve_fd >= 0) {
+        (void)close(w->reserve_fd);
+    }
     if (!w->draining) {
         atomic_fetch_add(&w->d->workers_off_listeners, 1);
     }

@@ -18,6 +18,8 @@
 #include "pacer.h"
 #include "pacerd/config.h"
 #include "pacerd/heap.h"
+#include "pacerd/log.h"
+#include "pacerd/util.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -40,9 +42,14 @@ struct pd_handle {
     int fd;
 };
 
+/* A listening socket and the limits shared by every worker that serves it.
+ * Lives for the whole run; reloads change the limits in place. */
 struct pd_listener {
     struct pd_handle h;
     uint32_t index;
+    _Atomic uint32_t conns; /* open connections across all workers */
+    pacer_table *ip_conns;  /* per-client holds and new-connection rate */
+    struct pd_log_limit reject_log;
 };
 
 /* One direction's buffer: bytes [start, end) are waiting to be written. */
@@ -65,7 +72,10 @@ struct pd_conn {
     uint64_t id;
     uint32_t li; /* listener index */
     int connecting;
-    int closed;           /* fds closed; freed after the current event batch */
+    int closed; /* fds closed; freed after the current event batch */
+    int held;   /* holds a slot in the listener's per-client table */
+    uint8_t key[PD_CLIENT_KEY_MAX];
+    uint8_t keylen;
     uint32_t mask[2];     /* epoll interest: [0] client fd, [1] upstream fd */
     struct pd_buf buf[2]; /* indexed by direction */
     int eof[2];           /* the direction's source sent FIN */
@@ -90,6 +100,8 @@ struct pd_worker {
     struct pd_conn *dead;  /* closed this batch; events may still point here */
     uint32_t nconns;
     int draining;
+    int reserve_fd;            /* spare fd, released to shed a connection at EMFILE */
+    uint64_t accept_paused_to; /* accepting resumes at this time; 0 when running */
 };
 
 struct pd_daemon {
@@ -115,7 +127,12 @@ void *pd_worker_main(void *arg);
 void pd_wake(int eventfd);
 
 /* Connections (proxy.c). accept takes ownership of the client fd. */
-void pd_conn_accept(struct pd_worker *w, uint32_t li, int fd, const struct sockaddr_storage *peer);
+void pd_conn_accept(struct pd_worker *w, struct pd_listener *l, int fd,
+                    const struct sockaddr_storage *peer);
+
+/* Log a refused connection, rate limited per listener. */
+void pd_log_reject(struct pd_listener *l, const char *listener, const char *peer,
+                   const char *reason, uint64_t now);
 void pd_conn_event(struct pd_conn *c, struct pd_handle *h, uint32_t events, uint64_t now);
 void pd_conn_timer(struct pd_conn *c, uint64_t now);
 void pd_conn_close(struct pd_conn *c, const char *reason);

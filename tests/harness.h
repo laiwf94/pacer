@@ -55,4 +55,10 @@ uint64_t now_ms(void);
 /* Connect to 127.0.0.1:port, blocking. Returns fd or -1. */
 int tcp_connect(uint16_t port);
 
+/* Same, from a chosen loopback source address such as "127.0.0.2". */
+int tcp_connect_from(uint16_t port, const char *src);
+
+/* When positive, the next spawned pacerd gets this RLIMIT_NOFILE. */
+extern int harness_nofile;
+
 #endif

@@ -44,6 +44,7 @@ struct pd_listener_conf {
     uint64_t min_rate_bytes; /* 0 disables the slow-client check */
     uint64_t min_rate_window_ns;
     uint32_t per_ip_max_conns; /* 0 means no cap */
+    uint32_t ipv6_prefix;      /* IPv6 clients are grouped by this prefix */
     struct pd_rate_opt per_ip_conn_rate;
     struct pd_rate_opt per_ip_bandwidth;
     struct pd_rate_opt bandwidth;

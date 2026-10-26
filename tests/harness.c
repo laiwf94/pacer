@@ -10,10 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+int harness_nofile;
 
 uint64_t now_ms(void)
 {
@@ -68,8 +71,12 @@ int proc_spawn(struct proc *p, const char *config_text, const char *const *args)
         argv[argc++] = strdup(strcmp(args[i], "%c") == 0 ? p->conf_path : args[i]);
     }
     argv[argc] = NULL;
+    struct rlimit rl = {(rlim_t)harness_nofile, (rlim_t)harness_nofile};
     pid_t pid = fork();
     if (pid == 0) {
+        if (harness_nofile > 0) {
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
         dup2(pipefd[1], 1);
         dup2(pipefd[1], 2);
         execv(argv[0], argv);
@@ -219,6 +226,11 @@ uint16_t free_port(void)
 
 int tcp_connect(uint16_t port)
 {
+    return tcp_connect_from(port, NULL);
+}
+
+int tcp_connect_from(uint16_t port, const char *src)
+{
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
@@ -226,6 +238,15 @@ int tcp_connect(uint16_t port)
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (fd < 0) {
         return -1;
+    }
+    if (src) {
+        struct sockaddr_in b = {0};
+        b.sin_family = AF_INET;
+        if (inet_pton(AF_INET, src, &b.sin_addr) != 1 ||
+            bind(fd, (struct sockaddr *)&b, sizeof b) != 0) {
+            close(fd);
+            return -1;
+        }
     }
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
         close(fd);

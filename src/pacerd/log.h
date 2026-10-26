@@ -11,6 +11,9 @@
 #ifndef PACERD_LOG_H
 #define PACERD_LOG_H
 
+#include "pacer.h"
+
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -36,6 +39,22 @@ void pd_log_end(struct pd_log_line *l);
 
 /* Shorthand for a line with just a message. */
 void pd_log_msg(int level, const char *msg);
+
+/*
+ * Rate limit for noisy lines (rejections under a flood). Lines over the
+ * limit are counted, and the next line allowed reports how many were
+ * dropped, so the log stays readable and nothing is silently lost.
+ */
+struct pd_log_limit {
+    pacer_gcra gcra;
+    _Atomic uint64_t suppressed;
+};
+
+void pd_log_limit_init(struct pd_log_limit *lim, uint64_t per_sec, uint64_t burst);
+
+/* Returns 1 if a line may be written now, and stores the number dropped
+ * since the last allowed line in *dropped. Returns 0 and counts otherwise. */
+int pd_log_allow(struct pd_log_limit *lim, uint64_t now_ns, uint64_t *dropped);
 
 /* Process-wide connection IDs, starting at 1. */
 uint64_t pd_next_conn_id(void);

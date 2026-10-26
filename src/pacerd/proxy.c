@@ -36,6 +36,14 @@ struct pd_conn *pd_conn_of_timer(struct pd_timer *t)
     return (struct pd_conn *)((char *)t - offsetof(struct pd_conn, timer));
 }
 
+static void format_peer(const struct sockaddr_storage *ss, char *buf, size_t len)
+{
+    struct pd_addr a;
+    memset(&a, 0, sizeof a);
+    memcpy(&a.ss, ss, sizeof *ss);
+    pd_addr_format(&a, buf, len);
+}
+
 static const struct pd_listener_conf *lconf(const struct pd_conn *c)
 {
     return &c->w->cfg->c.listeners[c->li];
@@ -273,6 +281,12 @@ void pd_conn_close(struct pd_conn *c, const char *reason)
     pd_log_end(&l);
 
     pd_heap_remove(&w->timers, &c->timer);
+    struct pd_listener *pl = &w->d->listeners[c->li];
+    if (c->held && pacer_table_release(pl->ip_conns, c->key, c->keylen) != PACER_OK) {
+        /* Holds are never evicted, so this would be a bookkeeping bug. */
+        pd_log_msg(PD_LOG_ERROR, "client table lost a hold");
+    }
+    atomic_fetch_sub_explicit(&pl->conns, 1, memory_order_relaxed);
     /* Closing a fd removes it from epoll. */
     (void)close(c->client.fd);
     if (c->upstream.fd >= 0) {
@@ -302,14 +316,6 @@ void pd_conn_reap(struct pd_worker *w)
     }
 }
 
-static void format_peer(const struct sockaddr_storage *ss, char *buf, size_t len)
-{
-    struct pd_addr a;
-    memset(&a, 0, sizeof a);
-    memcpy(&a.ss, ss, sizeof *ss);
-    pd_addr_format(&a, buf, len);
-}
-
 static void nodelay(int fd)
 {
     int one = 1;
@@ -337,19 +343,93 @@ static const char *connect_upstream(struct pd_conn *c, uint64_t now)
     return arm_timer(c);
 }
 
-void pd_conn_accept(struct pd_worker *w, uint32_t li, int fd, const struct sockaddr_storage *peer)
+void pd_log_reject(struct pd_listener *l, const char *listener, const char *peer,
+                   const char *reason, uint64_t now)
 {
+    uint64_t dropped = 0;
+    if (!pd_log_allow(&l->reject_log, now, &dropped)) {
+        return;
+    }
+    struct pd_log_line line;
+    pd_log_begin(&line, PD_LOG_INFO, "conn rejected");
+    pd_log_str(&line, "listener", listener);
+    pd_log_str(&line, "peer", peer);
+    pd_log_str(&line, "reason", reason);
+    if (dropped) {
+        pd_log_u64(&line, "similar_dropped", dropped);
+    }
+    pd_log_end(&line);
+}
+
+/*
+ * Admission: the listener's connection cap, then the client's concurrency
+ * cap and connection rate in one table call. Returns NULL when admitted,
+ * with the listener count and any hold taken, or the reason for refusal
+ * with nothing taken.
+ */
+static const char *admit(struct pd_listener *l, const struct pd_listener_conf *lc,
+                         const uint8_t *key, size_t keylen, uint64_t now, int *held)
+{
+    uint32_t n = atomic_fetch_add_explicit(&l->conns, 1, memory_order_relaxed);
+    if (n >= lc->max_conns) {
+        atomic_fetch_sub_explicit(&l->conns, 1, memory_order_relaxed);
+        return "listener_full";
+    }
+    if (lc->per_ip_max_conns == 0 && !lc->per_ip_conn_rate.on) {
+        return NULL;
+    }
+    uint32_t cap = lc->per_ip_max_conns ? lc->per_ip_max_conns : UINT32_MAX;
+    int rc = pacer_table_hold(l->ip_conns, key, keylen, now, cap, NULL);
+    if (rc == 1) {
+        *held = 1;
+        return NULL;
+    }
+    atomic_fetch_sub_explicit(&l->conns, 1, memory_order_relaxed);
+    switch (rc) {
+    case 0:
+        return "per_ip_rate";
+    case PACER_ELIMIT:
+        return "per_ip_conns";
+    case PACER_EFULL:
+        return "table_full";
+    default:
+        return "bad_address";
+    }
+}
+
+void pd_conn_accept(struct pd_worker *w, struct pd_listener *l, int fd,
+                    const struct sockaddr_storage *peer)
+{
+    uint32_t li = l->index;
     const struct pd_listener_conf *lc = &w->cfg->c.listeners[li];
+    uint64_t now = pacer_now_ns();
+    uint8_t key[PD_CLIENT_KEY_MAX];
+    size_t keylen = pd_client_key(peer, lc->ipv6_prefix, key);
+    int held = 0;
+    const char *refused = admit(l, lc, key, keylen, now, &held);
+    if (refused) {
+        char peer_s[64];
+        format_peer(peer, peer_s, sizeof peer_s);
+        (void)close(fd);
+        pd_log_reject(l, lc->name, peer_s, refused, now);
+        return;
+    }
     struct pd_conn *c = calloc(1, sizeof *c);
     char *mem = malloc((size_t)lc->buffer_size * 2);
     if (!c || !mem) {
         free(c);
         free(mem);
         (void)close(fd);
+        if (held) {
+            (void)pacer_table_release(l->ip_conns, key, keylen);
+        }
+        atomic_fetch_sub_explicit(&l->conns, 1, memory_order_relaxed);
         pd_log_msg(PD_LOG_WARN, "out of memory for a new connection");
         return;
     }
-    uint64_t now = pacer_now_ns();
+    memcpy(c->key, key, sizeof c->key);
+    c->keylen = (uint8_t)keylen;
+    c->held = held;
     c->w = w;
     c->li = li;
     c->id = pd_next_conn_id();
@@ -371,12 +451,12 @@ void pd_conn_accept(struct pd_worker *w, uint32_t li, int fd, const struct socka
     w->conns = c;
     w->nconns++;
 
-    struct pd_log_line l;
-    pd_log_begin(&l, PD_LOG_DEBUG, "conn open");
-    pd_log_u64(&l, "conn", c->id);
-    pd_log_str(&l, "listener", lc->name);
-    pd_log_str(&l, "peer", c->peer);
-    pd_log_end(&l);
+    struct pd_log_line line;
+    pd_log_begin(&line, PD_LOG_DEBUG, "conn open");
+    pd_log_u64(&line, "conn", c->id);
+    pd_log_str(&line, "listener", lc->name);
+    pd_log_str(&line, "peer", c->peer);
+    pd_log_end(&line);
 
     const char *why = connect_upstream(c, now);
     after(c, why);

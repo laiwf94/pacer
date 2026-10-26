@@ -63,6 +63,7 @@ TEST(config_full_example)
                        "    per_ip_bandwidth 1m/s burst 256k\n"
                        "    bandwidth 600/m\n"
                        "    table_size 4096\n"
+                       "    ipv6_prefix 56\n"
                        "    table_full evict\n"
                        "}\n"
                        "listener ssh {\n"
@@ -97,6 +98,7 @@ TEST(config_full_example)
     CHECK_EQ_U64(l->bandwidth.rate.period_ns, 60 * SEC);
     CHECK_EQ_U64(l->bandwidth.rate.burst, 600);
     CHECK_EQ_U64(l->table_size, 4096);
+    CHECK_EQ_U64(l->ipv6_prefix, 56);
     CHECK_EQ_INT(l->table_full, PACER_FULL_EVICT);
     l = &cfg.listeners[1];
     CHECK_EQ_U64(l->max_conns, 1024);
@@ -115,6 +117,8 @@ TEST(config_defaults)
     CHECK(cfg.admin_socket[0] == '\0');
     CHECK_EQ_U64(cfg.listeners[0].connect_timeout_ns, 5 * SEC);
     CHECK_EQ_U64(cfg.listeners[0].idle_timeout_ns, 300 * SEC);
+    CHECK_EQ_U64(cfg.listeners[0].ipv6_prefix, 64);
+    CHECK_EQ_U64(cfg.listeners[0].table_size, 16384);
 }
 
 TEST(config_rate_units)
@@ -171,6 +175,8 @@ TEST(config_value_errors)
     expect_listener_error("min_rate 64 per 11m", "a window between 1s and 10m");
     expect_listener_error("table_full maybe", "deny or evict");
     expect_listener_error("table_size 8", "table_size: must be between 16");
+    expect_listener_error("ipv6_prefix 16", "ipv6_prefix: must be between 32 and 128");
+    expect_listener_error("ipv6_prefix 129", "ipv6_prefix: must be between 32 and 128");
 }
 
 TEST(config_address_errors)

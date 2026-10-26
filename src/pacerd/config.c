@@ -241,7 +241,8 @@ static void listener_defaults(struct pd_listener_conf *l)
     l->buffer_size = 16 * 1024;
     l->connect_timeout_ns = 5 * SEC;
     l->idle_timeout_ns = 300 * SEC;
-    l->table_size = 65536;
+    l->table_size = 16384;
+    l->ipv6_prefix = 64;
     l->table_full = PACER_FULL_DENY;
 }
 
@@ -443,6 +444,7 @@ static const struct directive directives[] = {
     {"idle_timeout", 1, 1, 1, set_duration, L(idle_timeout_ns), SEC, 86400 * SEC},
     {"min_rate", 1, 1, 3, set_min_rate, 0, 0, 0},
     {"per_ip_max_conns", 1, 1, 1, set_u32, L(per_ip_max_conns), 0, 1000000},
+    {"ipv6_prefix", 1, 1, 1, set_u32, L(ipv6_prefix), 32, 128},
     {"per_ip_conn_rate", 1, 1, 3, set_rate, L(per_ip_conn_rate), 0, 0},
     {"per_ip_bandwidth", 1, 1, 3, set_rate, L(per_ip_bandwidth), 0, 0},
     {"bandwidth", 1, 1, 3, set_rate, L(bandwidth), 0, 0},

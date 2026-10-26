@@ -101,6 +101,39 @@ static void close_listeners(struct pd_daemon *d)
     }
 }
 
+static void free_listeners(struct pd_daemon *d)
+{
+    for (uint32_t i = 0; i < d->nlisteners; i++) {
+        pacer_table_destroy(d->listeners[i].ip_conns);
+        d->listeners[i].ip_conns = NULL;
+    }
+}
+
+/* With no per-client connection rate configured, the table still counts
+ * holds; this rate never denies. */
+static pacer_rate conn_rate(const struct pd_listener_conf *lc)
+{
+    pacer_rate unlimited = {1000000000ull, 1000000000ull, 1000000000ull};
+    return lc->per_ip_conn_rate.on ? lc->per_ip_conn_rate.rate : unlimited;
+}
+
+static int setup_limits(const struct pd_listener_conf *lc, struct pd_listener *l)
+{
+    pacer_table_config tc = {lc->table_size, 0, conn_rate(lc), NULL, lc->table_full};
+    int rc = pacer_table_create(&tc, &l->ip_conns);
+    if (rc != PACER_OK) {
+        struct pd_log_line line;
+        pd_log_begin(&line, PD_LOG_ERROR, "cannot create client table");
+        pd_log_str(&line, "listener", lc->name);
+        pd_log_str(&line, "error", pacer_strerror(rc));
+        pd_log_end(&line);
+        return -1;
+    }
+    atomic_init(&l->conns, 0);
+    pd_log_limit_init(&l->reject_log, 10, 20);
+    return 0;
+}
+
 static int setup_listeners(struct pd_daemon *d)
 {
     const struct pd_config *c = &d->cfg->c;
@@ -110,7 +143,8 @@ static int setup_listeners(struct pd_daemon *d)
         d->listeners[i].index = i;
     }
     for (uint32_t i = 0; i < c->nlisteners; i++) {
-        if (open_listener(&c->listeners[i], &d->listeners[i]) != 0) {
+        if (open_listener(&c->listeners[i], &d->listeners[i]) != 0 ||
+            setup_limits(&c->listeners[i], &d->listeners[i]) != 0) {
             return -1;
         }
     }
@@ -130,6 +164,7 @@ static int start_workers(struct pd_daemon *d)
         w->d = d;
         w->id = i;
         w->wake.kind = PD_H_WAKE;
+        w->reserve_fd = -1;
         pd_cfg_ref(d->cfg);
         w->cfg = d->cfg;
         atomic_init(&w->pending, NULL);
@@ -294,6 +329,7 @@ int pd_daemon_run(const char *config_path)
     }
     join_workers(&d);
     close_listeners(&d);
+    free_listeners(&d);
     if (rc == 0) {
         pd_log_msg(PD_LOG_INFO, "drained");
     }
