@@ -87,7 +87,9 @@ long recv_to_eof(int fd, uint64_t *hash, int timeout_ms)
         if (n < 0) {
             return -1;
         }
-        h = fnv(h, buf, (size_t)n);
+        if (hash) {
+            h = fnv(h, buf, (size_t)n);
+        }
         total += n;
     }
     if (hash) {
@@ -131,6 +133,17 @@ static void serve(struct upstream *u, int fd)
             size_t n = u->param - off < sizeof buf ? (size_t)(u->param - off) : sizeof buf;
             pattern(buf, n, off);
             if (send_all(fd, buf, n) < 0) {
+                break;
+            }
+            off += n;
+        }
+        break;
+    }
+    case UP_ZEROS: {
+        static const uint8_t zeros[65536];
+        for (uint64_t off = 0; off < u->param;) {
+            size_t n = u->param - off < sizeof zeros ? (size_t)(u->param - off) : sizeof zeros;
+            if (send_all(fd, zeros, n) < 0) {
                 break;
             }
             off += n;

@@ -13,6 +13,7 @@ enum upstream_mode {
     UP_SOURCE, /* send `param` pattern bytes, then close */
     UP_RESET,  /* read `param` bytes, then reset the connection */
     UP_STALL,  /* accept, then neither read nor write until stopped */
+    UP_ZEROS,  /* send `param` zero bytes as fast as possible, then close */
 };
 
 struct upstream {
@@ -40,7 +41,9 @@ void pattern(uint8_t *buf, size_t len, uint64_t off);
 long send_all(int fd, const void *buf, size_t len);
 long recv_all(int fd, void *buf, size_t len, int timeout_ms);
 
-/* Read until EOF or timeout; returns bytes read, or -1 on error/timeout. */
+/* Read until EOF or timeout; returns bytes read, or -1 on error/timeout.
+ * The FNV hash of the data goes to *hash; with hash NULL nothing is
+ * hashed, so the reader is not the bottleneck in benchmarks. */
 long recv_to_eof(int fd, uint64_t *hash, int timeout_ms);
 
 #endif

@@ -49,12 +49,13 @@ TEST_OBJ  := $(sort $(TEST_SRC:%.c=$(BUILD)/%.o))
 IT_OBJ    := $(sort $(IT_SRC:%.c=$(BUILD)/%.o))
 
 FUZZ_SRC  := $(wildcard fuzz/fuzz_*.c)
+BENCH_SRC := bench/bench_limiter.c bench/bench_proxy.c
 ALL_C     := $(LIB_SRC) $(PD_ALL) src/pacerd/main.c src/pacerctl/pacerctl.c \
-             $(sort $(TEST_SRC) $(IT_SRC)) $(FUZZ_SRC)
+             $(sort $(TEST_SRC) $(IT_SRC)) $(FUZZ_SRC) $(BENCH_SRC)
 ALL_SRC   := $(ALL_C) $(wildcard include/*.h src/*/*.h tests/*.h)
 
 .PHONY: all lib test run-tests check format format-check tidy coverage clean require-linux \
-        fuzz fuzz-smoke
+        fuzz fuzz-smoke bench bench-build
 
 all: lib $(BINS)
 
@@ -89,6 +90,21 @@ TEST_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
             TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 \
             LLVM_PROFILE_FILE=$(abspath $(BUILD))/prof/%p-%m.profraw \
             PACERD_BIN=$(BUILD)/pacerd PACERCTL_BIN=$(BUILD)/pacerctl
+
+$(BUILD)/bench_limiter: $(BUILD)/bench/bench_limiter.o $(BUILD)/libpacer.a
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(BUILD)/bench_proxy: $(BUILD)/bench/bench_proxy.o $(BUILD)/tests/harness.o \
+                      $(BUILD)/tests/upstream.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+bench-build:
+	$(MAKE) VARIANT=release build/release/bench_limiter build/release/bench_proxy build/release/pacerd
+
+# Benchmarks run on release builds; numbers depend on the machine.
+bench: bench-build
+	build/release/bench_limiter
+	PACERD_BIN=build/release/pacerd build/release/bench_proxy
 
 ifeq ($(UNAME),Linux)
 run-tests: $(BUILD)/unit $(BUILD)/pacerd $(BUILD)/pacerctl $(BUILD)/itest
@@ -150,6 +166,7 @@ check: require-linux
 	$(MAKE) format-check
 	$(MAKE) tidy
 	$(MAKE) -j$(JOBS) VARIANT=release all
+	$(MAKE) -j$(JOBS) bench-build
 	$(MAKE) -j$(JOBS) VARIANT=asan run-tests
 	$(MAKE) -j$(JOBS) VARIANT=tsan run-tests
 	$(MAKE) -j$(JOBS) coverage
@@ -159,4 +176,5 @@ check: require-linux
 clean:
 	rm -rf build
 
+-include $(BUILD)/bench/bench_limiter.d $(BUILD)/bench/bench_proxy.d
 -include $(LIB_OBJ:.o=.d) $(PD_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(IT_OBJ:.o=.d) $(BUILD)/src/pacerd/main.d $(BUILD)/src/pacerctl/pacerctl.d
