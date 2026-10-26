@@ -157,6 +157,9 @@ TEST(strerror_covers_every_code)
     CHECK(strcmp(pacer_strerror(PACER_OK), "ok") == 0);
     CHECK(strcmp(pacer_strerror(PACER_EINVAL), "invalid argument") == 0);
     CHECK(strcmp(pacer_strerror(PACER_ERANGE), "cost exceeds burst") == 0);
+    CHECK(strcmp(pacer_strerror(PACER_ENOMEM), "out of memory") == 0);
+    CHECK(strcmp(pacer_strerror(PACER_EFULL), "table full") == 0);
+    CHECK(strcmp(pacer_strerror(PACER_ENOENT), "no such key") == 0);
     CHECK(strcmp(pacer_strerror(12345), "unknown error") == 0);
 }
 

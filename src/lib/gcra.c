@@ -12,6 +12,12 @@ const char *pacer_strerror(int err)
         return "invalid argument";
     case PACER_ERANGE:
         return "cost exceeds burst";
+    case PACER_ENOMEM:
+        return "out of memory";
+    case PACER_EFULL:
+        return "table full";
+    case PACER_ENOENT:
+        return "no such key";
     default:
         return "unknown error";
     }
@@ -47,14 +53,18 @@ int pacer_gcra_init(pacer_gcra *g, const pacer_rate *r)
     return PACER_OK;
 }
 
+/*
+ * The state is a single word and publishes nothing else, so relaxed ordering
+ * is enough everywhere below: the CAS alone makes each update atomic, and a
+ * failed CAS reloads the current value for the next attempt.
+ */
+
 int pacer_gcra_take(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decision *d)
 {
     pacer_decision local;
     if (!d) {
         d = &local;
     }
-    /* The state is a single word and publishes nothing else, so relaxed
-     * ordering is enough: the CAS alone makes each update atomic. */
     uint64_t iv = atomic_load_explicit(&g->interval, memory_order_relaxed);
     uint64_t tol = atomic_load_explicit(&g->tolerance, memory_order_relaxed);
     uint64_t now = pacer_ticks(now_ns);
@@ -62,25 +72,15 @@ int pacer_gcra_take(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decisio
         *d = (pacer_decision){0, 0, 0};
         return PACER_ERANGE;
     }
-    uint64_t inc = cost * iv;
     uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
-    for (;;) {
-        uint64_t base = tat > now ? tat : now;
-        uint64_t next = base + inc;
-        if (next - now > tol) {
-            d->granted = 0;
-            d->remaining = pacer_avail(base - now, tol, iv);
-            d->retry_after_ns = pacer_ticks_to_ns_ceil(next - now - tol);
-            return 0;
-        }
+    uint64_t next = 0;
+    while (pacer_step_take(tat, now, cost, iv, tol, &next, d)) {
         if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
                                                   memory_order_relaxed)) {
-            d->granted = cost;
-            d->remaining = pacer_avail(next - now, tol, iv);
-            d->retry_after_ns = 0;
             return 1;
         }
     }
+    return 0;
 }
 
 uint64_t pacer_gcra_remaining(pacer_gcra *g, uint64_t now_ns)
@@ -102,27 +102,14 @@ uint64_t pacer_gcra_take_upto(pacer_gcra *g, uint64_t now_ns, uint64_t max, pace
     uint64_t tol = atomic_load_explicit(&g->tolerance, memory_order_relaxed);
     uint64_t now = pacer_ticks(now_ns);
     uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
-    for (;;) {
-        uint64_t base = tat > now ? tat : now;
-        uint64_t avail = pacer_avail(base - now, tol, iv);
-        uint64_t grant = avail < max ? avail : max;
-        if (grant == 0) {
-            d->granted = 0;
-            d->remaining = avail;
-            /* One token fits once base - now drops to tol - iv. When max is
-             * 0 nothing was asked for, so there is nothing to wait for. */
-            d->retry_after_ns = max == 0 ? 0 : pacer_ticks_to_ns_ceil(base - now + iv - tol);
-            return 0;
-        }
-        uint64_t next = base + grant * iv;
+    uint64_t next = 0, grant = 0;
+    while ((grant = pacer_step_upto(tat, now, max, iv, tol, &next, d)) != 0) {
         if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
                                                   memory_order_relaxed)) {
-            d->granted = grant;
-            d->remaining = avail - grant;
-            d->retry_after_ns = 0;
             return grant;
         }
     }
+    return 0;
 }
 
 void pacer_gcra_refund(pacer_gcra *g, uint64_t now_ns, uint64_t tokens)
@@ -130,16 +117,11 @@ void pacer_gcra_refund(pacer_gcra *g, uint64_t now_ns, uint64_t tokens)
     uint64_t iv = atomic_load_explicit(&g->interval, memory_order_relaxed);
     uint64_t tol = atomic_load_explicit(&g->tolerance, memory_order_relaxed);
     uint64_t now = pacer_ticks(now_ns);
-    /* Refunding more than a bucket's worth is the same as a full bucket. */
-    uint64_t back = tokens > tol / iv ? tol : tokens * iv;
     uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
     for (;;) {
-        if (tat <= now) {
-            return;
-        }
-        uint64_t next = tat - now > back ? tat - back : now;
-        if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
-                                                  memory_order_relaxed)) {
+        uint64_t next = pacer_step_refund(tat, now, tokens, iv, tol);
+        if (next == tat || atomic_compare_exchange_weak_explicit(
+                               &g->tat, &tat, next, memory_order_relaxed, memory_order_relaxed)) {
             return;
         }
     }
