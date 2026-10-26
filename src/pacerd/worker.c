@@ -77,8 +77,10 @@ static void on_wake(struct pd_worker *w)
         w->cfg = next;
     }
     if (atomic_load(&w->d->draining) && !w->draining) {
+        /* Open connections carry on until both sides finish, so bytes in
+         * flight are delivered; the drain timeout bounds the wait. */
         stop_accepting(w);
-        close_all(w, "shutdown");
+        w->drain_deadline = pacer_now_ns() + w->cfg->c.drain_timeout_ns;
     }
 }
 
@@ -169,6 +171,9 @@ static int wait_ms(struct pd_worker *w, uint64_t now)
     if (w->accept_paused_to && w->accept_paused_to < next) {
         next = w->accept_paused_to;
     }
+    if (w->draining && w->drain_deadline < next) {
+        next = w->drain_deadline;
+    }
     if (next == UINT64_MAX) {
         return -1;
     }
@@ -221,6 +226,14 @@ void *pd_worker_main(void *arg)
             }
             run_timers(w, now);
             maybe_resume_accepting(w, now);
+            if (w->draining && now >= w->drain_deadline && w->nconns > 0) {
+                struct pd_log_line l;
+                pd_log_begin(&l, PD_LOG_WARN, "drain timeout");
+                pd_log_u64(&l, "worker", w->id);
+                pd_log_u64(&l, "closing", w->nconns);
+                pd_log_end(&l);
+                close_all(w, "drain_timeout");
+            }
             pd_conn_reap(w);
         }
     }

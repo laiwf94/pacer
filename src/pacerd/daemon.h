@@ -107,6 +107,7 @@ struct pd_worker {
     struct pd_conn *dead;  /* closed this batch; events may still point here */
     uint32_t nconns;
     int draining;
+    uint64_t drain_deadline;
     uint64_t now;              /* clock read once per loop iteration */
     int reserve_fd;            /* spare fd, released to shed a connection at EMFILE */
     uint64_t accept_paused_to; /* accepting resumes at this time; 0 when running */
@@ -129,6 +130,14 @@ struct pd_daemon {
 
 /* Run the daemon until it has drained. Returns the process exit code. */
 int pd_daemon_run(const char *config_path);
+
+/*
+ * Reload the config file. Limits, timeouts, upstreams and the log level
+ * change in place; anything tied to a socket or to memory sized at start
+ * (listen addresses, table sizes, workers, the admin socket) cannot, and a
+ * file that changes them is refused. Returns 0 or -1; the reason is in err.
+ */
+int pd_daemon_reload(struct pd_daemon *d, char *err, size_t errlen);
 
 /* Worker thread body and wake-up. */
 void *pd_worker_main(void *arg);

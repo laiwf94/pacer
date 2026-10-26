@@ -242,12 +242,108 @@ static void free_workers(struct pd_daemon *d)
     free(d->workers);
 }
 
+/* Why `next` cannot replace `cur` in place, or NULL if it can. */
+static const char *reload_conflict(const struct pd_config *cur, const struct pd_config *next,
+                                   char *buf, size_t len)
+{
+    if (next->workers != cur->workers) {
+        return "workers cannot change without a restart";
+    }
+    if (strcmp(next->admin_socket, cur->admin_socket) != 0) {
+        return "admin_socket cannot change without a restart";
+    }
+    if (next->nlisteners != cur->nlisteners) {
+        return "listeners cannot be added or removed without a restart";
+    }
+    for (uint32_t i = 0; i < cur->nlisteners; i++) {
+        const struct pd_listener_conf *a = &cur->listeners[i], *b = &next->listeners[i];
+        const char *what = NULL;
+        if (strcmp(a->name, b->name) != 0) {
+            what = "name";
+        } else if (a->listen.len != b->listen.len ||
+                   memcmp(&a->listen.ss, &b->listen.ss, a->listen.len) != 0) {
+            what = "listen";
+        } else if (a->table_size != b->table_size) {
+            what = "table_size";
+        } else if (a->table_full != b->table_full) {
+            what = "table_full";
+        }
+        if (what) {
+            (void)snprintf(buf, len, "listener %s: %s cannot change without a restart", a->name,
+                           what);
+            return buf;
+        }
+    }
+    return NULL;
+}
+
+int pd_daemon_reload(struct pd_daemon *d, char *err, size_t errlen)
+{
+    char why[PD_ERR_MAX];
+    struct pd_cfg *next = pd_cfg_load(d->config_path, err, errlen);
+    if (!next) {
+        return -1;
+    }
+    const char *conflict = reload_conflict(&d->cfg->c, &next->c, why, sizeof why);
+    if (conflict) {
+        (void)snprintf(err, errlen, "%s", conflict);
+        pd_cfg_unref(next);
+        return -1;
+    }
+    /* The new rates were validated by the parser, so reconfigure cannot
+     * fail here. */
+    for (uint32_t i = 0; i < d->nlisteners; i++) {
+        const struct pd_listener_conf *lc = &next->c.listeners[i];
+        struct pd_listener *l = &d->listeners[i];
+        pacer_rate conns = rate_or_unlimited(&lc->per_ip_conn_rate);
+        pacer_rate ip_bytes = rate_or_unlimited(&lc->per_ip_bandwidth);
+        pacer_rate bytes = rate_or_unlimited(&lc->bandwidth);
+        (void)pacer_table_reconfigure(l->ip_conns, &conns);
+        (void)pacer_table_reconfigure(l->ip_bytes, &ip_bytes);
+        (void)pacer_gcra_reconfigure(&l->bytes, &bytes);
+    }
+    pd_log_set_level(next->c.log_level);
+    /* Each worker gets its own reference. A worker that has not yet picked
+     * up an earlier config hands it back here instead. */
+    for (uint32_t i = 0; i < d->started; i++) {
+        struct pd_worker *w = &d->workers[i];
+        pd_cfg_ref(next);
+        pd_cfg_unref(atomic_exchange(&w->pending, next));
+        pd_wake(w->wake.fd);
+    }
+    pd_cfg_unref(d->cfg);
+    d->cfg = next;
+    return 0;
+}
+
+static void reload(struct pd_daemon *d, const char *source)
+{
+    char err[PD_ERR_MAX];
+    struct pd_log_line l;
+    if (atomic_load(&d->draining)) {
+        pd_log_msg(PD_LOG_WARN, "reload ignored while draining");
+        return;
+    }
+    if (pd_daemon_reload(d, err, sizeof err) != 0) {
+        pd_log_begin(&l, PD_LOG_ERROR, "reload rejected, keeping the running config");
+        pd_log_str(&l, "source", source);
+        pd_log_str(&l, "error", err);
+        pd_log_end(&l);
+        return;
+    }
+    pd_log_begin(&l, PD_LOG_INFO, "reloaded");
+    pd_log_str(&l, "source", source);
+    pd_log_end(&l);
+}
+
 static int on_signal(struct pd_daemon *d, int sfd)
 {
     struct signalfd_siginfo si;
     while (read(sfd, &si, sizeof si) == (ssize_t)sizeof si) {
         if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT) {
             begin_drain(d, si.ssi_signo == SIGTERM ? "SIGTERM" : "SIGINT");
+        } else if (si.ssi_signo == SIGHUP) {
+            reload(d, "SIGHUP");
         }
     }
     return 0;

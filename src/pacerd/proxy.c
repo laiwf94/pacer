@@ -372,6 +372,11 @@ static const char *check_rate(struct pd_conn *c, uint64_t now)
     if (!c->next_rate_check || now < c->next_rate_check) {
         return NULL;
     }
+    if (lc->min_rate_bytes == 0) {
+        /* Switched off by a reload. */
+        c->next_rate_check = 0;
+        return NULL;
+    }
     uint64_t window = lc->min_rate_window_ns;
     c->next_rate_check = now + window / 10;
     if (c->last_throttle && c->last_throttle + window > now) {
