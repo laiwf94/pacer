@@ -1,3 +1,4 @@
+#include "lib/table_check.h"
 #include "pacer.h"
 #include "test.h"
 
@@ -10,7 +11,7 @@ static const uint8_t fixed_key[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
 
 static pacer_table *make_table(uint32_t max_entries, uint32_t shards, uint64_t burst)
 {
-    pacer_table_config cfg = {max_entries, shards, {10, SEC, burst}, fixed_key};
+    pacer_table_config cfg = {max_entries, shards, {10, SEC, burst}, fixed_key, PACER_FULL_DENY};
     pacer_table *t = NULL;
     CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_OK);
     return t;
@@ -24,7 +25,7 @@ static size_t key_name(char *buf, size_t cap, unsigned i)
 TEST(table_rejects_bad_config)
 {
     pacer_table *t = NULL;
-    pacer_table_config cfg = {0, 0, {10, SEC, 1}, NULL};
+    pacer_table_config cfg = {0, 0, {10, SEC, 1}, NULL, PACER_FULL_DENY};
     CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_EINVAL);
     cfg.max_entries = 100;
     cfg.shards = 3;
@@ -35,6 +36,9 @@ TEST(table_rejects_bad_config)
     cfg.rate.tokens = 0;
     CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_EINVAL);
     cfg.rate.tokens = 1;
+    cfg.full_policy = 7;
+    CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_EINVAL);
+    cfg.full_policy = PACER_FULL_DENY;
     cfg.max_entries = (1u << 28) + 1;
     CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_EINVAL);
     CHECK_EQ_INT(pacer_table_create(NULL, &t), PACER_EINVAL);
@@ -127,6 +131,7 @@ TEST(table_delete_keeps_probe_chains_intact)
         size_t len = key_name(k, sizeof k, victim);
         CHECK_EQ_INT(pacer_table_remove(t, k, len), PACER_OK);
         CHECK_EQ_INT(pacer_table_remove(t, k, len), PACER_ENOENT);
+        CHECK_EQ_INT(pacer_table_check(t), 0);
         removed[victim] = 1;
         unsigned lost = 0;
         for (unsigned i = 0; i < n; i++) {
@@ -198,10 +203,136 @@ TEST(table_memory_is_fixed_at_create)
 
 TEST(table_random_hash_key)
 {
-    pacer_table_config cfg = {10, 0, {10, SEC, 1}, NULL};
+    pacer_table_config cfg = {10, 0, {10, SEC, 1}, NULL, PACER_FULL_DENY};
     pacer_table *t = NULL;
     CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_OK);
     CHECK_EQ_INT(pacer_table_take(t, "a", 1, SEC, 1, NULL), 1);
     CHECK_EQ_INT(pacer_table_take(t, "a", 1, SEC, 1, NULL), 0);
+    pacer_table_destroy(t);
+}
+
+static pacer_table *make_policy_table(uint32_t max_entries, int policy)
+{
+    pacer_table_config cfg = {max_entries, 1, {10, SEC, 1}, fixed_key, policy};
+    pacer_table *t = NULL;
+    CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_OK);
+    return t;
+}
+
+static int take_key(pacer_table *t, unsigned i, uint64_t now)
+{
+    char k[32];
+    size_t n = key_name(k, sizeof k, i);
+    return pacer_table_take(t, k, n, now, 1, NULL);
+}
+
+TEST(table_reclaims_idle_entries_without_a_sweep)
+{
+    /* At 10/s with burst 1, an entry is idle 100 ms after its last take. */
+    pacer_table *t = make_policy_table(16, PACER_FULL_DENY);
+    for (unsigned i = 0; i < 16; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), 1);
+    }
+    CHECK_EQ_INT(take_key(t, 100, SEC), PACER_EFULL);
+    uint64_t later = SEC + SEC / 10;
+    for (unsigned i = 100; i < 116; i++) {
+        CHECK_EQ_INT(take_key(t, i, later), 1);
+    }
+    pacer_table_stats st;
+    pacer_table_get_stats(t, &st);
+    CHECK_EQ_U64(st.entries, 16);
+    CHECK_EQ_U64(st.reclaims, 16);
+    CHECK_EQ_U64(st.rejections, 1);
+    pacer_table_destroy(t);
+}
+
+TEST(table_deny_policy_keeps_active_debt)
+{
+    pacer_table *t = make_policy_table(16, PACER_FULL_DENY);
+    for (unsigned i = 0; i < 16; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), 1);
+    }
+    for (unsigned i = 100; i < 200; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), PACER_EFULL);
+    }
+    /* Every original key still owes its debt. */
+    for (unsigned i = 0; i < 16; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), 0);
+    }
+    pacer_table_destroy(t);
+}
+
+TEST(table_evict_policy_drops_least_recently_used)
+{
+    pacer_table *t = make_policy_table(16, PACER_FULL_EVICT);
+    for (unsigned i = 0; i < 16; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), 1);
+    }
+    /* Touch key 0 so key 1 becomes the coldest. */
+    CHECK_EQ_INT(take_key(t, 0, SEC), 0);
+    CHECK_EQ_INT(take_key(t, 100, SEC), 1);
+    CHECK_EQ_INT(take_key(t, 1, SEC), 1); /* forgotten, so admitted fresh */
+    CHECK_EQ_INT(take_key(t, 0, SEC), 0); /* still remembered */
+    pacer_table_stats st;
+    pacer_table_get_stats(t, &st);
+    CHECK_EQ_U64(st.evictions, 2);
+    CHECK_EQ_U64(st.entries, 16);
+    pacer_table_destroy(t);
+}
+
+TEST(table_sweep_removes_only_idle_entries)
+{
+    pacer_table_config cfg = {1024, 4, {10, SEC, 1}, fixed_key, PACER_FULL_DENY};
+    pacer_table *t = NULL;
+    CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_OK);
+    for (unsigned i = 0; i < 500; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), 1);
+    }
+    for (unsigned i = 500; i < 800; i++) {
+        CHECK_EQ_INT(take_key(t, i, 2 * SEC), 1);
+    }
+    /* At 2.05 s the first 500 are idle and the last 300 are not. */
+    CHECK_EQ_U64(pacer_table_sweep(t, 2 * SEC + SEC / 20, 100), 500);
+    CHECK_EQ_INT(pacer_table_check(t), 0);
+    pacer_table_stats st;
+    pacer_table_get_stats(t, &st);
+    CHECK_EQ_U64(st.entries, 300);
+    for (unsigned i = 500; i < 800; i++) {
+        CHECK_EQ_INT(take_key(t, i, 2 * SEC), 0);
+    }
+    /* Sweeping one shard at a time visits them round robin. */
+    size_t removed = 0;
+    for (int n = 0; n < 4; n++) {
+        removed += pacer_table_sweep(t, 10 * SEC, 1);
+    }
+    CHECK_EQ_U64(removed, 300);
+    pacer_table_destroy(t);
+}
+
+TEST(table_lru_survives_heavy_churn)
+{
+    /* Random-looking churn with removes, reclaims and evictions; the LRU
+     * list must stay consistent with the slot array throughout. */
+    pacer_table *t = make_policy_table(64, PACER_FULL_EVICT);
+    uint64_t now = SEC;
+    for (unsigned step = 0; step < 20000; step++) {
+        unsigned k = (step * 2654435761u) % 300;
+        if (step % 7 == 0) {
+            char buf[32];
+            size_t n = key_name(buf, sizeof buf, k);
+            (void)pacer_table_remove(t, buf, n);
+        } else {
+            CHECK(take_key(t, k, now) >= 0);
+        }
+        now += SEC / 1000;
+        if (pacer_table_check(t) != 0) {
+            CHECK_EQ_INT(pacer_table_check(t), 0);
+            break;
+        }
+    }
+    pacer_table_stats st;
+    pacer_table_get_stats(t, &st);
+    CHECK(st.entries <= 64);
+    CHECK_EQ_U64(st.inserts, st.entries + st.removals + st.reclaims + st.evictions);
     pacer_table_destroy(t);
 }

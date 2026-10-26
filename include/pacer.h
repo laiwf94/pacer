@@ -138,18 +138,33 @@ int pacer_gcra_reconfigure(pacer_gcra *g, const pacer_rate *r);
 
 typedef struct pacer_table pacer_table;
 
+/*
+ * What to do when a new key arrives and its shard is full. The table first
+ * reclaims an idle entry (one whose bucket has refilled, which is identical
+ * to a fresh entry, so dropping it changes no decision). If none of the
+ * least recently used entries is idle:
+ *   PACER_FULL_DENY refuses the new key and keeps everyone's debt;
+ *   PACER_FULL_EVICT drops the least recently used entry and its debt.
+ * DENY is the safe default against an attacker spraying source addresses:
+ * EVICT would let them reset other clients' limits.
+ */
+enum { PACER_FULL_DENY = 0, PACER_FULL_EVICT = 1 };
+
 typedef struct pacer_table_config {
     uint32_t max_entries;    /* capacity in keys, >= 1 */
     uint32_t shards;         /* power of two; 0 picks 64 (fewer for small tables) */
     pacer_rate rate;         /* applied to every key */
     const uint8_t *hash_key; /* 16 bytes, or NULL for a random key */
+    int full_policy;         /* PACER_FULL_DENY or PACER_FULL_EVICT */
 } pacer_table_config;
 
 typedef struct pacer_table_stats {
     uint64_t entries;    /* keys currently held */
     uint64_t capacity;   /* maximum keys */
     uint64_t inserts;    /* keys admitted since create */
-    uint64_t removals;   /* keys removed explicitly or by eviction */
+    uint64_t removals;   /* keys removed explicitly or by sweep */
+    uint64_t reclaims;   /* idle keys dropped to make room */
+    uint64_t evictions;  /* keys with debt dropped under PACER_FULL_EVICT */
     uint64_t rejections; /* keys refused because the table was full */
 } pacer_table_stats;
 
@@ -185,6 +200,14 @@ int pacer_table_remove(pacer_table *t, const void *key, size_t len);
 
 /* Change the per-key rate for every key, keeping debt as time. */
 int pacer_table_reconfigure(pacer_table *t, const pacer_rate *r);
+
+/*
+ * Remove idle entries from the next `nshards` shards (round robin across
+ * calls) and return how many were removed. Each shard is scanned under its
+ * lock in one pass. Calling it is optional: inserts reclaim idle entries on
+ * their own; sweeping keeps `entries` honest and room ready.
+ */
+size_t pacer_table_sweep(pacer_table *t, uint64_t now_ns, uint32_t nshards);
 
 /* Snapshot of the counters, summed over shards. */
 void pacer_table_get_stats(pacer_table *t, pacer_table_stats *out);
