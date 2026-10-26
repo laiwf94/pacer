@@ -86,6 +86,10 @@ struct pd_conn {
     uint64_t start_ns;
     uint64_t connect_deadline;
     uint64_t throttled_to[2]; /* reading the direction's source waits until then */
+    uint64_t last_throttle;   /* end of the latest wait imposed by shaping */
+    uint64_t last_io;         /* when bytes last moved either way */
+    uint64_t next_rate_check; /* 0 when the slow-client check is off */
+    pacer_window moved;       /* bytes moved, both directions, for min_rate */
     struct pd_timer timer;
     char peer[64];
 };

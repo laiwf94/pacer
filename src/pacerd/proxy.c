@@ -237,6 +237,7 @@ static const char *pump(struct pd_conn *c, int dir, uint64_t now)
     uint64_t grant = reserve(c, space, now, &retry);
     if (grant == 0) {
         c->throttled_to[dir] = now + (retry ? retry : 1);
+        c->last_throttle = c->throttled_to[dir];
         return NULL;
     }
     ssize_t n = recv(src_fd(c, dir), b->data + b->end, (size_t)grant, 0);
@@ -252,6 +253,10 @@ static const char *pump(struct pd_conn *c, int dir, uint64_t now)
     } else {
         b->end += (uint32_t)n;
         c->bytes[dir] += (uint64_t)n;
+        c->last_io = now;
+        if (c->next_rate_check) {
+            pacer_window_add(&c->moved, now, (uint64_t)n);
+        }
     }
     return flush(c, dir);
 }
@@ -259,6 +264,11 @@ static const char *pump(struct pd_conn *c, int dir, uint64_t now)
 static int finished(const struct pd_conn *c)
 {
     return c->shut[PD_UP] && c->shut[PD_DOWN];
+}
+
+static uint64_t idle_deadline(const struct pd_conn *c)
+{
+    return c->connecting ? 0 : c->last_io + lconf(c)->idle_timeout_ns;
 }
 
 static uint64_t earliest(uint64_t a, uint64_t b)
@@ -276,6 +286,8 @@ static const char *arm_timer(struct pd_conn *c)
     uint64_t next = c->connecting ? c->connect_deadline : 0;
     next = earliest(next, c->throttled_to[PD_UP]);
     next = earliest(next, c->throttled_to[PD_DOWN]);
+    next = earliest(next, idle_deadline(c));
+    next = earliest(next, c->next_rate_check);
     if (next == 0) {
         pd_heap_remove(&c->w->timers, &c->timer);
         return NULL;
@@ -286,7 +298,7 @@ static const char *arm_timer(struct pd_conn *c)
     return pd_heap_set(&c->w->timers, &c->timer, next) != 0 ? "out_of_memory" : NULL;
 }
 
-static const char *finish_connect(struct pd_conn *c)
+static const char *finish_connect(struct pd_conn *c, uint64_t now)
 {
     int err = 0;
     socklen_t len = sizeof err;
@@ -300,6 +312,7 @@ static const char *finish_connect(struct pd_conn *c)
         return err == ECONNREFUSED ? "upstream_refused" : "upstream_unreachable";
     }
     c->connecting = 0;
+    c->last_io = now;
     return flush(c, PD_UP);
 }
 
@@ -308,7 +321,7 @@ static const char *handle_event(struct pd_conn *c, struct pd_handle *h, uint32_t
 {
     const char *why = NULL;
     if (h->kind == PD_H_UPSTREAM && c->connecting) {
-        return finish_connect(c);
+        return finish_connect(c, now);
     }
     int in_dir = h->kind == PD_H_CLIENT ? PD_UP : PD_DOWN;
     int out_dir = in_dir == PD_UP ? PD_DOWN : PD_UP;
@@ -346,10 +359,40 @@ void pd_conn_event(struct pd_conn *c, struct pd_handle *h, uint32_t events, uint
     after(c, handle_event(c, h, events, now));
 }
 
+/*
+ * Slow-client check. A slowloris client sends just enough to dodge the idle
+ * timeout and holds its slot for ever. Once a full window has passed, a
+ * connection that moved fewer than min_rate bytes in the last window, in
+ * either direction, is cut. A connection that shaping held back during the
+ * window is exempt: the slowness was ours.
+ */
+static const char *check_rate(struct pd_conn *c, uint64_t now)
+{
+    const struct pd_listener_conf *lc = lconf(c);
+    if (!c->next_rate_check || now < c->next_rate_check) {
+        return NULL;
+    }
+    uint64_t window = lc->min_rate_window_ns;
+    c->next_rate_check = now + window / 10;
+    if (c->last_throttle && c->last_throttle + window > now) {
+        return NULL;
+    }
+    return pacer_window_count(&c->moved, now) < lc->min_rate_bytes ? "slow_client" : NULL;
+}
+
 void pd_conn_timer(struct pd_conn *c, uint64_t now)
 {
     if (c->connecting && c->connect_deadline <= now) {
         pd_conn_close(c, "connect_timeout");
+        return;
+    }
+    if (!c->connecting && idle_deadline(c) <= now) {
+        pd_conn_close(c, "idle_timeout");
+        return;
+    }
+    const char *why = check_rate(c, now);
+    if (why) {
+        pd_conn_close(c, why);
         return;
     }
     for (int dir = 0; dir < 2; dir++) {
@@ -530,6 +573,11 @@ void pd_conn_accept(struct pd_worker *w, struct pd_listener *l, int fd,
     c->li = li;
     c->id = pd_next_conn_id();
     c->start_ns = now;
+    c->last_io = now;
+    if (lc->min_rate_bytes &&
+        pacer_window_init(&c->moved, lc->min_rate_window_ns, 10, now) == PACER_OK) {
+        c->next_rate_check = now + lc->min_rate_window_ns;
+    }
     c->client.kind = PD_H_CLIENT;
     c->client.fd = fd;
     c->upstream.kind = PD_H_UPSTREAM;
