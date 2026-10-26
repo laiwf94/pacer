@@ -64,7 +64,14 @@ static void log_errno(const char *msg, const char *what, int err)
     pd_log_end(&l);
 }
 
-static int open_listener(const struct pd_listener_conf *lc, struct pd_listener *l)
+/*
+ * Open a listening socket. Each worker gets its own with SO_REUSEPORT. A
+ * reuseport group would also admit a second pacerd run by the same user,
+ * which would then take a share of the connections, so the address is
+ * first claimed once without SO_REUSEPORT: if that fails, someone else
+ * holds the port.
+ */
+static int open_listener(const struct pd_listener_conf *lc, int reuseport)
 {
     char addr[64];
     pd_addr_format(&lc->listen, addr, sizeof addr);
@@ -77,26 +84,30 @@ static int open_listener(const struct pd_listener_conf *lc, struct pd_listener *
     /* SO_REUSEADDR lets a restart bind while old connections sit in
      * TIME_WAIT. V6ONLY keeps [::]:port from also claiming IPv4. */
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (reuseport) {
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one);
+    }
     if (lc->listen.ss.ss_family == AF_INET6) {
         (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     }
     if (bind(fd, (const struct sockaddr *)&lc->listen.ss, lc->listen.len) != 0 ||
-        listen(fd, LISTEN_BACKLOG) != 0) {
+        (reuseport && listen(fd, LISTEN_BACKLOG) != 0)) {
         log_errno("cannot listen", addr, errno);
         (void)close(fd);
         return -1;
     }
-    l->h.kind = PD_H_LISTENER;
-    l->h.fd = fd;
-    return 0;
+    return fd;
 }
 
 static void close_listeners(struct pd_daemon *d)
 {
-    for (uint32_t i = 0; i < d->nlisteners; i++) {
-        if (d->listeners[i].h.fd >= 0) {
-            (void)close(d->listeners[i].h.fd);
-            d->listeners[i].h.fd = -1;
+    for (uint32_t w = 0; w < d->nworkers; w++) {
+        for (uint32_t i = 0; i < d->nlisteners; i++) {
+            struct pd_listen_sock *ls = &d->workers[w].lsocks[i];
+            if (ls->h.fd >= 0) {
+                (void)close(ls->h.fd);
+                ls->h.fd = -1;
+            }
         }
     }
 }
@@ -150,12 +161,15 @@ static int setup_listeners(struct pd_daemon *d)
     const struct pd_config *c = &d->cfg->c;
     d->nlisteners = c->nlisteners;
     for (uint32_t i = 0; i < c->nlisteners; i++) {
-        d->listeners[i].h.fd = -1;
         d->listeners[i].index = i;
     }
     for (uint32_t i = 0; i < c->nlisteners; i++) {
-        if (open_listener(&c->listeners[i], &d->listeners[i]) != 0 ||
-            setup_limits(&c->listeners[i], &d->listeners[i]) != 0) {
+        int probe = open_listener(&c->listeners[i], 0);
+        if (probe < 0) {
+            return -1;
+        }
+        (void)close(probe);
+        if (setup_limits(&c->listeners[i], &d->listeners[i]) != 0) {
             return -1;
         }
     }
@@ -176,6 +190,9 @@ static int start_workers(struct pd_daemon *d)
         w->id = i;
         w->wake.kind = PD_H_WAKE;
         w->reserve_fd = -1;
+        for (uint32_t li = 0; li < PD_MAX_LISTENERS; li++) {
+            w->lsocks[li] = (struct pd_listen_sock){{PD_H_LISTENER, -1}, li};
+        }
         pd_cfg_ref(d->cfg);
         w->cfg = d->cfg;
         atomic_init(&w->pending, NULL);
@@ -187,6 +204,13 @@ static int start_workers(struct pd_daemon *d)
             log_errno("cannot create worker event fds", NULL, errno);
             d->nworkers = i + 1;
             return -1;
+        }
+        for (uint32_t li = 0; li < d->nlisteners; li++) {
+            w->lsocks[li].h.fd = open_listener(&d->cfg->c.listeners[li], 1);
+            if (w->lsocks[li].h.fd < 0) {
+                d->nworkers = i + 1;
+                return -1;
+            }
         }
     }
     for (uint32_t i = 0; i < d->nworkers; i++) {
@@ -460,7 +484,9 @@ int pd_daemon_run(const char *config_path)
     }
     join_workers(&d);
     pd_admin_close(&d);
-    close_listeners(&d);
+    if (d.workers) {
+        close_listeners(&d);
+    }
     free_listeners(&d);
     if (rc == 0) {
         pd_log_msg(PD_LOG_INFO, "drained");

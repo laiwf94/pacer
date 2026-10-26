@@ -2,8 +2,9 @@
  * pacerd internals: the shared daemon state, worker threads and connections.
  *
  * Threads: the main thread owns signals (through signalfd), config reloads
- * and the admin socket. Each worker thread runs its own epoll loop over the
- * shared listening sockets (EPOLLEXCLUSIVE) and the connections it accepted.
+ * and the admin socket. Each worker thread runs its own epoll loop over its
+ * own listening socket per listener (SO_REUSEPORT, so the kernel spreads new
+ * connections across workers) and the connections it accepted.
  * A connection never moves between workers. Shared state between threads is
  * limited to the per-listener limiters (lock-free or sharded), atomic
  * counters, and config objects handed over by reference count.
@@ -87,10 +88,9 @@ struct pd_admin_client {
     char buf[256];
 };
 
-/* A listening socket and the limits shared by every worker that serves it.
- * Lives for the whole run; reloads change the limits in place. */
+/* The limits shared by every worker that serves a listener. Lives for the
+ * whole run; reloads change the limits in place. */
 struct pd_listener {
-    struct pd_handle h;
     uint32_t index;
     _Atomic uint32_t conns; /* open connections across all workers */
     pacer_table *ip_conns;  /* per-client holds and new-connection rate */
@@ -139,12 +139,19 @@ struct pd_conn {
     char peer[64];
 };
 
+/* One worker's listening socket for one listener. */
+struct pd_listen_sock {
+    struct pd_handle h;
+    uint32_t li;
+};
+
 struct pd_worker {
     struct pd_daemon *d;
     uint32_t id;
     pthread_t thread;
     int epfd;
     struct pd_handle wake; /* eventfd: drain, reload */
+    struct pd_listen_sock lsocks[PD_MAX_LISTENERS];
     _Atomic(struct pd_cfg *) pending;
     struct pd_cfg *cfg;
     struct pd_heap timers;

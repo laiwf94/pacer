@@ -224,6 +224,14 @@ size_t pd_stats_render(struct pd_daemon *d, char *buf, size_t len)
                      (unsigned long long)ts.entries, (unsigned long long)ts.capacity,
                      (unsigned long long)ts.evictions);
     }
+    for (uint32_t w = 0; w < d->started; w++) {
+        uint64_t accepted = 0;
+        for (uint32_t li = 0; li < d->nlisteners; li++) {
+            accepted += atomic_load_explicit(&d->workers[w].stats[li][PD_ST_ACCEPTED],
+                                             memory_order_relaxed);
+        }
+        pos = append(buf, len, pos, "worker=%u accepted=%llu\n", w, (unsigned long long)accepted);
+    }
     return pos;
 }
 

@@ -29,19 +29,15 @@ static void listeners_off(struct pd_worker *w)
     for (uint32_t i = 0; i < w->d->nlisteners; i++) {
         /* The listener stays open until every worker has let go of it, so
          * this cannot race with the main thread closing it. */
-        (void)epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->d->listeners[i].h.fd, NULL);
+        (void)epoll_ctl(w->epfd, EPOLL_CTL_DEL, w->lsocks[i].h.fd, NULL);
     }
 }
 
 static int listeners_on(struct pd_worker *w)
 {
     for (uint32_t i = 0; i < w->d->nlisteners; i++) {
-        /* EPOLLEXCLUSIVE wakes one worker per new connection instead of
-         * all of them. */
-        struct epoll_event ev = {.events = EPOLLIN | EPOLLEXCLUSIVE,
-                                 .data.ptr = &w->d->listeners[i].h};
-        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->d->listeners[i].h.fd, &ev) != 0 &&
-            errno != EEXIST) {
+        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = &w->lsocks[i].h};
+        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->lsocks[i].h.fd, &ev) != 0 && errno != EEXIST) {
             return -1;
         }
     }
@@ -91,12 +87,13 @@ static void on_wake(struct pd_worker *w)
  * sees a clean close instead of a hang), then take the spare back. If the
  * spare cannot be had, stop accepting for a short while instead.
  */
-static void shed_connection(struct pd_worker *w, struct pd_listener *l, uint64_t now)
+static void shed_connection(struct pd_worker *w, struct pd_listen_sock *ls, uint64_t now)
 {
-    const char *name = w->cfg->c.listeners[l->index].name;
+    struct pd_listener *l = &w->d->listeners[ls->li];
+    const char *name = w->cfg->c.listeners[ls->li].name;
     if (w->reserve_fd >= 0) {
         (void)close(w->reserve_fd);
-        int fd = accept4(l->h.fd, NULL, NULL, SOCK_CLOEXEC);
+        int fd = accept4(ls->h.fd, NULL, NULL, SOCK_CLOEXEC);
         if (fd >= 0) {
             (void)close(fd);
             pd_count(w, l->index, "fd_exhausted");
@@ -112,12 +109,13 @@ static void shed_connection(struct pd_worker *w, struct pd_listener *l, uint64_t
     }
 }
 
-static void on_listener(struct pd_worker *w, struct pd_listener *l, uint64_t now)
+static void on_listener(struct pd_worker *w, struct pd_listen_sock *ls, uint64_t now)
 {
+    struct pd_listener *l = &w->d->listeners[ls->li];
     for (int i = 0; i < ACCEPT_PER_WAKE && !w->accept_paused_to; i++) {
         struct sockaddr_storage peer;
         socklen_t len = sizeof peer;
-        int fd = accept4(l->h.fd, (struct sockaddr *)&peer, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int fd = accept4(ls->h.fd, (struct sockaddr *)&peer, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd >= 0) {
             pd_conn_accept(w, l, fd, &peer);
             continue;
@@ -126,9 +124,9 @@ static void on_listener(struct pd_worker *w, struct pd_listener *l, uint64_t now
             continue;
         }
         if (errno == EMFILE || errno == ENFILE) {
-            shed_connection(w, l, now);
+            shed_connection(w, ls, now);
         }
-        /* EAGAIN: the queue is empty or another worker got there first. */
+        /* EAGAIN: the queue is empty. */
         return;
     }
 }
@@ -218,7 +216,7 @@ void *pd_worker_main(void *arg)
                     break;
                 case PD_H_LISTENER:
                     if (!w->draining) {
-                        on_listener(w, (struct pd_listener *)h, now);
+                        on_listener(w, (struct pd_listen_sock *)h, now);
                     }
                     break;
                 default:

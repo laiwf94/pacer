@@ -5,6 +5,7 @@
 
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -241,4 +242,28 @@ TEST(pacerctl_without_a_server)
     longpath[sizeof longpath - 1] = '\0';
     const char *toolong[] = {"-s", longpath, "ping", NULL};
     CHECK_EQ_INT(run_ctl(out, sizeof out, toolong), 2);
+}
+
+TEST(admin_connections_spread_across_workers)
+{
+    /* Each worker has its own SO_REUSEPORT socket, so the kernel hashes new
+     * connections across them instead of one worker taking a burst. */
+    start("");
+    for (int i = 0; i < 64; i++) {
+        int fd = tcp_connect(port);
+        CHECK(works(fd));
+        close(fd);
+    }
+    char out[8192];
+    CHECK_EQ_INT(ctl(out, sizeof out, "stats"), 0);
+    const char *w0 = strstr(out, "worker=0 accepted=");
+    const char *w1 = strstr(out, "worker=1 accepted=");
+    CHECK(w0 != NULL);
+    CHECK(w1 != NULL);
+    long a = w0 ? strtol(w0 + 18, NULL, 10) : 0;
+    long b = w1 ? strtol(w1 + 18, NULL, 10) : 0;
+    CHECK_EQ_INT(a + b, 64);
+    CHECK(a >= 8);
+    CHECK(b >= 8);
+    finish();
 }
