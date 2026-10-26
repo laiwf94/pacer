@@ -164,7 +164,7 @@ enum { PACER_FULL_DENY = 0, PACER_FULL_EVICT = 1 };
 
 typedef struct pacer_table_config {
     uint32_t max_entries;    /* capacity in keys, >= 1 */
-    uint32_t shards;         /* power of two; 0 picks 64 (fewer for small tables) */
+    uint32_t shards;         /* power of two; 0 picks up to 1024, >= 64 keys each */
     pacer_rate rate;         /* applied to every key */
     const uint8_t *hash_key; /* 16 bytes, or NULL for a random key */
     int full_policy;         /* PACER_FULL_DENY or PACER_FULL_EVICT */

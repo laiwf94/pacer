@@ -11,8 +11,8 @@
 #define CACHE_LINE     64
 #define MAX_SHARDS     65536u
 #define MAX_ENTRIES    (1u << 28)
-#define DEFAULT_SHARDS 64u
-#define MIN_PER_SHARD  16u
+#define DEFAULT_SHARDS 1024u
+#define MIN_PER_SHARD  64u
 #define NIL            UINT32_MAX
 /* How many entries from the cold end of the LRU list an insert examines
  * looking for an idle one before applying the full-table policy. */
@@ -80,6 +80,11 @@ static uint32_t log2_u32(uint32_t v)
     return r;
 }
 
+/*
+ * As many shards as keep at least MIN_PER_SHARD keys each, up to 1024. More
+ * shards mean fewer threads meeting on one lock; with too few keys per
+ * shard, hashing imbalance fills some shards while others still have room.
+ */
 static uint32_t pick_shards(uint32_t max_entries)
 {
     uint32_t n = DEFAULT_SHARDS;

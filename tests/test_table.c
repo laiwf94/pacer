@@ -185,9 +185,10 @@ TEST(table_memory_is_fixed_at_create)
 {
     pacer_table *t = make_table(65536, 0, 1);
     size_t before = pacer_table_memory(t);
-    /* 65536 keys at 75% load need 2048 slots in each of 64 shards. */
-    CHECK(before >= (size_t)64 * 2048 * 64);
-    CHECK(before < (size_t)64 * 2048 * 64 + (size_t)64 * 1024);
+    /* 65536 keys in 1024 shards of 64, each in 128 slots of 64 bytes:
+     * 8 MiB of entries plus the shard headers. */
+    CHECK(before >= (size_t)1024 * 128 * 64);
+    CHECK(before < (size_t)1024 * 128 * 64 + (size_t)1024 * 256);
     char k[32];
     for (unsigned i = 0; i < 70000; i++) {
         size_t n = key_name(k, sizeof k, i);
