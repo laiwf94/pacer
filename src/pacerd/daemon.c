@@ -261,6 +261,9 @@ static void free_workers(struct pd_daemon *d)
         if (w->wake.fd >= 0) {
             (void)close(w->wake.fd);
         }
+        /* A reload can reach a worker after it stopped for a failure, in
+         * which case the config it never picked up is still pending. */
+        pd_cfg_unref(atomic_exchange(&w->pending, NULL));
         pd_cfg_unref(w->cfg);
     }
     free(d->workers);
