@@ -233,4 +233,35 @@ void pacer_table_get_stats(pacer_table *t, pacer_table_stats *out);
 /* Bytes allocated by the table, fixed at create time. */
 size_t pacer_table_memory(const pacer_table *t);
 
+/*
+ * Sliding-window counter: how many events (bytes, requests) happened in the
+ * last `window_ns`. The window is cut into `slots` buckets plus the one
+ * being filled. The oldest bucket is weighted by how much of it is still
+ * inside the window, so the count is within one bucket's worth of exact.
+ *
+ * Not thread-safe: each window belongs to one owner (a connection). It is a
+ * plain struct with no allocation; embed it and init it.
+ */
+#define PACER_WINDOW_SLOTS_MAX 16
+
+typedef struct pacer_window {
+    uint64_t slot_ns;    /* width of one bucket */
+    uint64_t head_start; /* start of the bucket being filled */
+    uint64_t total;      /* sum of all buckets */
+    uint32_t n;          /* buckets in the ring: slots + 1 */
+    uint32_t head;       /* index of the bucket being filled */
+    uint64_t counts[PACER_WINDOW_SLOTS_MAX + 1];
+} pacer_window;
+
+/* Set up an empty window starting at `now_ns`. `slots` is 1 to
+ * PACER_WINDOW_SLOTS_MAX and window_ns must be at least `slots`. */
+int pacer_window_init(pacer_window *w, uint64_t window_ns, uint32_t slots, uint64_t now_ns);
+
+/* Record `n` events at `now_ns`. Times earlier than the newest seen are
+ * counted as the newest. */
+void pacer_window_add(pacer_window *w, uint64_t now_ns, uint64_t n);
+
+/* Events in (now_ns - window_ns, now_ns], with the oldest bucket weighted. */
+uint64_t pacer_window_count(pacer_window *w, uint64_t now_ns);
+
 #endif
