@@ -3,8 +3,14 @@
 
 CC       := clang
 VARIANT  ?= release
-BUILD    := build/$(VARIANT)
 UNAME    := $(shell uname -s)
+# Native builds on other systems get their own tree, so they never mix
+# objects with the Linux container's when the checkout is shared.
+ifeq ($(UNAME),Linux)
+  BUILD  := build/$(VARIANT)
+else
+  BUILD  := build/$(UNAME)/$(VARIANT)
+endif
 JOBS     ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 CPPFLAGS := -Iinclude -Isrc -D_GNU_SOURCE
@@ -34,8 +40,9 @@ else
   $(error unknown VARIANT $(VARIANT))
 endif
 
-# The event loop needs epoll, signalfd and eventfd; elsewhere only the
-# library, the portable parts of the daemon and the unit tests are built.
+# pacerd and pacerctl need Linux (epoll, signalfd, eventfd, SOCK_CLOEXEC);
+# elsewhere only the library, the portable parts of the daemon and the unit
+# tests are built.
 LINUX_SRC := src/pacerd/daemon.c src/pacerd/worker.c src/pacerd/proxy.c src/pacerd/admin.c
 LIB_SRC   := $(wildcard src/lib/*.c)
 PD_ALL    := $(filter-out src/pacerd/main.c,$(wildcard src/pacerd/*.c))
@@ -44,7 +51,7 @@ ifeq ($(UNAME),Linux)
   BINS    := $(BUILD)/pacerd $(BUILD)/pacerctl
 else
   PD_SRC  := $(filter-out $(LINUX_SRC),$(PD_ALL))
-  BINS    := $(BUILD)/pacerctl
+  BINS    :=
 endif
 TEST_SRC  := $(wildcard tests/test_*.c) tests/test_main.c
 IT_SRC    := $(wildcard tests/it_*.c) tests/harness.c tests/upstream.c tests/test_main.c
@@ -90,7 +97,13 @@ $(BUILD)/pacerctl: $(BUILD)/src/pacerctl/pacerctl.o $(BUILD)/libpacerd.a $(BUILD
 $(BUILD)/itest: $(IT_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^
 
-TEST_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+# LeakSanitizer is part of ASan on Linux only.
+ifeq ($(UNAME),Linux)
+  LEAKS := 1
+else
+  LEAKS := 0
+endif
+TEST_ENV := ASAN_OPTIONS=detect_leaks=$(LEAKS):abort_on_error=1 \
             UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
             TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 \
             LLVM_PROFILE_FILE=$(abspath $(BUILD))/prof/%p-%m.profraw \
