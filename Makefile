@@ -29,19 +29,31 @@ else
   $(error unknown VARIANT $(VARIANT))
 endif
 
+# The event loop needs epoll, signalfd and eventfd; elsewhere only the
+# library, the portable parts of the daemon and the unit tests are built.
+LINUX_SRC := src/pacerd/daemon.c src/pacerd/worker.c
 LIB_SRC   := $(wildcard src/lib/*.c)
-PD_SRC    := $(filter-out src/pacerd/main.c,$(wildcard src/pacerd/*.c))
+PD_ALL    := $(filter-out src/pacerd/main.c,$(wildcard src/pacerd/*.c))
+ifeq ($(UNAME),Linux)
+  PD_SRC  := $(PD_ALL)
+  BINS    := $(BUILD)/pacerd
+else
+  PD_SRC  := $(filter-out $(LINUX_SRC),$(PD_ALL))
+  BINS    :=
+endif
 TEST_SRC  := $(wildcard tests/test_*.c) tests/test_main.c
+IT_SRC    := $(wildcard tests/it_*.c) tests/harness.c tests/test_main.c
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/%.o)
 PD_OBJ    := $(PD_SRC:%.c=$(BUILD)/%.o)
 TEST_OBJ  := $(sort $(TEST_SRC:%.c=$(BUILD)/%.o))
+IT_OBJ    := $(sort $(IT_SRC:%.c=$(BUILD)/%.o))
 
-ALL_C     := $(LIB_SRC) $(PD_SRC) $(sort $(TEST_SRC))
+ALL_C     := $(LIB_SRC) $(PD_ALL) src/pacerd/main.c $(sort $(TEST_SRC) $(IT_SRC))
 ALL_SRC   := $(ALL_C) $(wildcard include/*.h src/*/*.h tests/*.h)
 
 .PHONY: all lib test run-tests check format format-check tidy coverage clean require-linux
 
-all: lib
+all: lib $(BINS)
 
 lib: $(BUILD)/libpacer.a
 
@@ -60,12 +72,26 @@ $(BUILD)/libpacerd.a: $(PD_OBJ)
 $(BUILD)/unit: $(TEST_OBJ) $(BUILD)/libpacerd.a $(BUILD)/libpacer.a
 	$(CC) $(LDFLAGS) -o $@ $^
 
+$(BUILD)/pacerd: $(BUILD)/src/pacerd/main.o $(BUILD)/libpacerd.a $(BUILD)/libpacer.a
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(BUILD)/itest: $(IT_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+TEST_ENV := ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+            UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 \
+            LLVM_PROFILE_FILE=$(abspath $(BUILD))/prof/%p-%m.profraw \
+            PACERD_BIN=$(BUILD)/pacerd
+
+ifeq ($(UNAME),Linux)
+run-tests: $(BUILD)/unit $(BUILD)/pacerd $(BUILD)/itest
+	$(TEST_ENV) $(BUILD)/unit
+	$(TEST_ENV) $(BUILD)/itest
+else
 run-tests: $(BUILD)/unit
-	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
-	UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-	TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 \
-	LLVM_PROFILE_FILE=$(abspath $(BUILD))/prof/%p-%m.profraw \
-	$(BUILD)/unit
+	$(TEST_ENV) $(BUILD)/unit
+endif
 
 test:
 	$(MAKE) VARIANT=asan run-tests
@@ -82,7 +108,7 @@ tidy:
 coverage:
 	rm -rf build/cov/prof
 	$(MAKE) VARIANT=cov run-tests
-	scripts/coverage.sh build/cov 90 build/cov/unit
+	scripts/coverage.sh build/cov 90 build/cov/unit build/cov/pacerd
 
 require-linux:
 ifneq ($(UNAME),Linux)
@@ -102,4 +128,4 @@ check: require-linux
 clean:
 	rm -rf build
 
--include $(LIB_OBJ:.o=.d) $(PD_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+-include $(LIB_OBJ:.o=.d) $(PD_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(IT_OBJ:.o=.d) $(BUILD)/src/pacerd/main.d
