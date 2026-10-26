@@ -13,11 +13,8 @@
 #ifndef PACER_H
 #define PACER_H
 
+#include <stdbool.h>
 #include <stdint.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 #define PACER_VERSION "0.1.0"
 
@@ -30,8 +27,73 @@ const char *pacer_version(void);
  */
 uint64_t pacer_now_ns(void);
 
-#ifdef __cplusplus
-}
-#endif
+/* Error codes. Functions that can fail return 0 or one of these. */
+enum {
+    PACER_OK = 0,
+    PACER_EINVAL = -1, /* argument or configuration out of range */
+    PACER_ERANGE = -2, /* cost larger than the burst: can never be granted */
+};
+
+/* Short description of an error code, never NULL. */
+const char *pacer_strerror(int err);
+
+/*
+ * A rate: `tokens` per `period_ns`, with a bucket `burst` tokens deep. A
+ * fresh limiter grants `burst` tokens at once, then refills at the rate.
+ * Example: 10 per second with burst 20 is {10, 1000000000, 20}.
+ */
+typedef struct pacer_rate {
+    uint64_t tokens;
+    uint64_t period_ns;
+    uint64_t burst;
+} pacer_rate;
+
+/*
+ * Internally time is kept in ticks of 1/64 ns so that high byte rates keep
+ * their precision. The emission interval is rounded up, so the limiter never
+ * grants faster than configured; the relative error is below 1/interval,
+ * under 0.2% for rates up to 10^8 per second. Faster rates are capped at
+ * one token per tick. Timestamps past PACER_MAX_NOW_NS (about 4.5 years of
+ * process uptime) are clamped.
+ */
+#define PACER_TICK_SHIFT    6
+#define PACER_MAX_NOW_NS    ((uint64_t)1 << 57)
+#define PACER_MAX_TOL_TICKS ((uint64_t)1 << 62)
+
+/* The outcome of a take. */
+typedef struct pacer_decision {
+    uint64_t granted;        /* tokens granted; 0 when denied */
+    uint64_t remaining;      /* tokens still available after this call */
+    uint64_t retry_after_ns; /* when nothing was granted: wait this long */
+} pacer_decision;
+
+/*
+ * Generic cell rate algorithm limiter. The whole state is one 64-bit
+ * theoretical arrival time updated with compare-and-swap, so takes from any
+ * number of threads are lock-free. The struct may be embedded anywhere;
+ * there is nothing to destroy.
+ */
+typedef struct pacer_gcra {
+    _Atomic uint64_t tat;       /* theoretical arrival time, ticks */
+    _Atomic uint64_t interval;  /* ticks per token */
+    _Atomic uint64_t tolerance; /* burst * interval, ticks */
+} pacer_gcra;
+
+/* Validate a rate and compute its interval and tolerance in ticks. */
+int pacer_rate_ticks(const pacer_rate *r, uint64_t *interval, uint64_t *tolerance);
+
+/* Initialise a limiter with a full bucket. Not thread-safe. */
+int pacer_gcra_init(pacer_gcra *g, const pacer_rate *r);
+
+/*
+ * Take `cost` tokens at `now_ns`, all or nothing. Returns 1 when granted, 0
+ * when denied (state unchanged, d->retry_after_ns says when the same cost
+ * would fit), or PACER_ERANGE when cost exceeds the burst. A cost of 0 is
+ * always granted and only reports `remaining`. `d` may be NULL.
+ */
+int pacer_gcra_take(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decision *d);
+
+/* Tokens available at `now_ns` without taking any. */
+uint64_t pacer_gcra_remaining(pacer_gcra *g, uint64_t now_ns);
 
 #endif
