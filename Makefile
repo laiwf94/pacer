@@ -15,6 +15,11 @@ LDFLAGS  := -pthread
 
 ifeq ($(VARIANT),release)
   CFLAGS += -O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+  # STATIC=1 links libc statically for the scratch Docker image. pacerd
+  # does no name lookups, so static glibc has no NSS caveats here.
+  ifeq ($(STATIC),1)
+    LDFLAGS += -static
+  endif
 else ifeq ($(VARIANT),asan)
   SAN := -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
   CFLAGS += -O1 $(SAN)
