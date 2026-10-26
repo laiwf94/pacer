@@ -429,3 +429,15 @@ TEST(table_evict_skips_held_entries)
     CHECK_EQ_INT(pacer_table_release(t, k, n), PACER_OK);
     pacer_table_destroy(t);
 }
+
+TEST(table_take_range)
+{
+    pacer_table *t = make_table(100, 0, 100);
+    pacer_decision d;
+    CHECK_EQ_INT(pacer_table_take_range(t, "k", 1, SEC, 1, 95, &d), PACER_OK);
+    CHECK_EQ_U64(d.granted, 95);
+    CHECK_EQ_INT(pacer_table_take_range(t, "k", 1, SEC, 10, 95, &d), PACER_OK);
+    CHECK_EQ_U64(d.granted, 0);
+    CHECK_EQ_U64(d.retry_after_ns, SEC / 2);
+    pacer_table_destroy(t);
+}

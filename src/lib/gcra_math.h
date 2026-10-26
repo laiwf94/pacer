@@ -53,25 +53,38 @@ static inline int pacer_step_take(uint64_t tat, uint64_t now, uint64_t cost, uin
     return 1;
 }
 
-/* Take whatever is available up to max. Returns the grant; *next is set
- * only when the grant is non-zero. */
-static inline uint64_t pacer_step_upto(uint64_t tat, uint64_t now, uint64_t max, uint64_t iv,
-                                       uint64_t tol, uint64_t *next, pacer_decision *d)
+/*
+ * Take between min and max tokens: as many as are available up to max, or
+ * nothing if fewer than min are. Returns the grant; *next is set only when
+ * it is non-zero. A min above the burst is lowered to the burst, and a min
+ * of 0 counts as 1.
+ */
+static inline uint64_t pacer_step_range(uint64_t tat, uint64_t now, uint64_t min, uint64_t max,
+                                        uint64_t iv, uint64_t tol, uint64_t *next,
+                                        pacer_decision *d)
 {
     uint64_t base = tat > now ? tat : now;
     uint64_t avail = pacer_avail(base - now, tol, iv);
+    uint64_t depth = tol / iv;
+    if (min == 0) {
+        min = 1;
+    } else if (min > depth) {
+        min = depth;
+    }
+    d->granted = 0;
+    d->remaining = avail;
+    d->retry_after_ns = 0;
+    if (max == 0) {
+        return 0;
+    }
+    if (avail < min) {
+        /* min tokens fit once base - now drops to tol - min * iv. */
+        d->retry_after_ns = pacer_ticks_to_ns_ceil(base - now + min * iv - tol);
+        return 0;
+    }
     uint64_t grant = avail < max ? avail : max;
     d->granted = grant;
     d->remaining = avail - grant;
-    d->retry_after_ns = 0;
-    if (grant == 0) {
-        /* One token fits once base - now drops to tol - iv. When max is 0
-         * nothing was asked for, so there is nothing to wait for. */
-        if (max != 0) {
-            d->retry_after_ns = pacer_ticks_to_ns_ceil(base - now + iv - tol);
-        }
-        return 0;
-    }
     *next = base + grant * iv;
     return grant;
 }

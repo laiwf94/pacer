@@ -96,6 +96,12 @@ uint64_t pacer_gcra_remaining(pacer_gcra *g, uint64_t now_ns)
 
 uint64_t pacer_gcra_take_upto(pacer_gcra *g, uint64_t now_ns, uint64_t max, pacer_decision *d)
 {
+    return pacer_gcra_take_range(g, now_ns, 1, max, d);
+}
+
+uint64_t pacer_gcra_take_range(pacer_gcra *g, uint64_t now_ns, uint64_t min, uint64_t max,
+                               pacer_decision *d)
+{
     pacer_decision local;
     if (!d) {
         d = &local;
@@ -105,7 +111,7 @@ uint64_t pacer_gcra_take_upto(pacer_gcra *g, uint64_t now_ns, uint64_t max, pace
     uint64_t now = pacer_ticks(now_ns);
     uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
     uint64_t next = 0, grant = 0;
-    while ((grant = pacer_step_upto(tat, now, max, iv, tol, &next, d)) != 0) {
+    while ((grant = pacer_step_range(tat, now, min, max, iv, tol, &next, d)) != 0) {
         if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
                                                   memory_order_relaxed)) {
             return grant;

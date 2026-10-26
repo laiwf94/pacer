@@ -202,6 +202,7 @@ void *pd_worker_main(void *arg)
                 break;
             }
             uint64_t now = pacer_now_ns();
+            w->now = now;
             for (int i = 0; i < n; i++) {
                 struct pd_handle *h = events[i].data.ptr;
                 switch (h->kind) {

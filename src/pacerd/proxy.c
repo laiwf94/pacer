@@ -93,11 +93,16 @@ static const char *set_interest(struct pd_conn *c, int side, uint32_t mask)
     return NULL;
 }
 
+static int can_read(const struct pd_conn *c, int dir)
+{
+    return !c->eof[dir] && buf_space(&c->buf[dir]) > 0 && c->throttled_to[dir] == 0;
+}
+
 /* Recompute what each fd waits for. */
 static const char *update(struct pd_conn *c)
 {
     uint32_t cm = 0, um = 0;
-    if (!c->eof[PD_UP] && buf_space(&c->buf[PD_UP]) > 0) {
+    if (can_read(c, PD_UP)) {
         cm |= EPOLLIN;
     }
     if (buf_used(&c->buf[PD_DOWN]) > 0) {
@@ -106,7 +111,7 @@ static const char *update(struct pd_conn *c)
     if (c->connecting) {
         um = EPOLLOUT;
     } else {
-        if (!c->eof[PD_DOWN] && buf_space(&c->buf[PD_DOWN]) > 0) {
+        if (can_read(c, PD_DOWN)) {
             um |= EPOLLIN;
         }
         if (buf_used(&c->buf[PD_UP]) > 0) {
@@ -151,8 +156,72 @@ static const char *flush(struct pd_conn *c, int dir)
     return NULL;
 }
 
-/* Read from the source of `dir` into its buffer, then try to write it on. */
-static const char *pump(struct pd_conn *c, int dir)
+/* When a table cannot track the client (full of active entries under the
+ * deny policy), its bytes wait and are retried after this long. */
+#define UNTRACKED_RETRY_NS 50000000ull
+
+/* The smallest read worth waking up for while shaped. Without a minimum,
+ * a connection whose socket is always readable would grab each token the
+ * moment it appears and keep slower-waking connections out entirely. */
+#define READ_QUANTUM 4096u
+
+static uint64_t quantum(uint64_t want)
+{
+    return want < READ_QUANTUM ? want : READ_QUANTUM;
+}
+
+/*
+ * Reserve up to `want` bytes from the client's and the listener's byte
+ * limiters. Returns the grant; when it is 0, *retry is how long to wait.
+ * Unused tokens go back through give_back.
+ */
+static uint64_t reserve(struct pd_conn *c, uint64_t want, uint64_t now, uint64_t *retry)
+{
+    struct pd_listener *l = &c->w->d->listeners[c->li];
+    const struct pd_listener_conf *lc = lconf(c);
+    uint64_t grant = want;
+    *retry = 0;
+    if (lc->per_ip_bandwidth.on) {
+        pacer_decision d;
+        if (pacer_table_take_range(l->ip_bytes, c->key, c->keylen, now, quantum(grant), grant,
+                                   &d) != PACER_OK) {
+            *retry = UNTRACKED_RETRY_NS;
+            return 0;
+        }
+        grant = d.granted;
+        *retry = d.retry_after_ns;
+    }
+    if (grant > 0 && lc->bandwidth.on) {
+        pacer_decision d;
+        uint64_t g = pacer_gcra_take_range(&l->bytes, now, quantum(grant), grant, &d);
+        if (g < grant && lc->per_ip_bandwidth.on) {
+            pacer_table_refund(l->ip_bytes, c->key, c->keylen, now, grant - g);
+        }
+        grant = g;
+        *retry = d.retry_after_ns;
+    }
+    return grant;
+}
+
+static void give_back(struct pd_conn *c, uint64_t tokens, uint64_t now)
+{
+    struct pd_listener *l = &c->w->d->listeners[c->li];
+    const struct pd_listener_conf *lc = lconf(c);
+    if (tokens == 0) {
+        return;
+    }
+    if (lc->per_ip_bandwidth.on) {
+        pacer_table_refund(l->ip_bytes, c->key, c->keylen, now, tokens);
+    }
+    if (lc->bandwidth.on) {
+        pacer_gcra_refund(&l->bytes, now, tokens);
+    }
+}
+
+/* Read from the source of `dir` into its buffer, then try to write it on.
+ * Reads are sized by the byte limiters; when they are empty the source is
+ * left unread until the retry time, and TCP flow control pushes back. */
+static const char *pump(struct pd_conn *c, int dir, uint64_t now)
 {
     struct pd_buf *b = &c->buf[dir];
     if (b->end == b->cap && b->start > 0) {
@@ -160,11 +229,18 @@ static const char *pump(struct pd_conn *c, int dir)
         b->end -= b->start;
         b->start = 0;
     }
-    uint32_t want = b->cap - b->end;
-    if (want == 0 || c->eof[dir]) {
+    uint32_t space = b->cap - b->end;
+    if (space == 0 || c->eof[dir] || c->throttled_to[dir]) {
         return NULL;
     }
-    ssize_t n = recv(src_fd(c, dir), b->data + b->end, want, 0);
+    uint64_t retry = 0;
+    uint64_t grant = reserve(c, space, now, &retry);
+    if (grant == 0) {
+        c->throttled_to[dir] = now + (retry ? retry : 1);
+        return NULL;
+    }
+    ssize_t n = recv(src_fd(c, dir), b->data + b->end, (size_t)grant, 0);
+    give_back(c, n > 0 ? grant - (uint64_t)n : grant, now);
     if (n < 0) {
         if (errno == EAGAIN || errno == EINTR) {
             return NULL;
@@ -185,18 +261,29 @@ static int finished(const struct pd_conn *c)
     return c->shut[PD_UP] && c->shut[PD_DOWN];
 }
 
+static uint64_t earliest(uint64_t a, uint64_t b)
+{
+    if (a == 0) {
+        return b;
+    }
+    return b != 0 && b < a ? b : a;
+}
+
 /* Queue the connection's earliest deadline. A connection that cannot get
  * a timer slot is closed: it could otherwise wait forever. */
 static const char *arm_timer(struct pd_conn *c)
 {
-    if (c->connecting) {
-        if (pd_heap_set(&c->w->timers, &c->timer, c->connect_deadline) != 0) {
-            return "out_of_memory";
-        }
-    } else {
+    uint64_t next = c->connecting ? c->connect_deadline : 0;
+    next = earliest(next, c->throttled_to[PD_UP]);
+    next = earliest(next, c->throttled_to[PD_DOWN]);
+    if (next == 0) {
         pd_heap_remove(&c->w->timers, &c->timer);
+        return NULL;
     }
-    return NULL;
+    if (c->timer.slot && c->timer.deadline == next) {
+        return NULL;
+    }
+    return pd_heap_set(&c->w->timers, &c->timer, next) != 0 ? "out_of_memory" : NULL;
 }
 
 static const char *finish_connect(struct pd_conn *c)
@@ -213,11 +300,11 @@ static const char *finish_connect(struct pd_conn *c)
         return err == ECONNREFUSED ? "upstream_refused" : "upstream_unreachable";
     }
     c->connecting = 0;
-    const char *why = arm_timer(c);
-    return why ? why : flush(c, PD_UP);
+    return flush(c, PD_UP);
 }
 
-static const char *handle_event(struct pd_conn *c, struct pd_handle *h, uint32_t events)
+static const char *handle_event(struct pd_conn *c, struct pd_handle *h, uint32_t events,
+                                uint64_t now)
 {
     const char *why = NULL;
     if (h->kind == PD_H_UPSTREAM && c->connecting) {
@@ -227,7 +314,7 @@ static const char *handle_event(struct pd_conn *c, struct pd_handle *h, uint32_t
     int out_dir = in_dir == PD_UP ? PD_DOWN : PD_UP;
     /* Errors and hang-ups surface through the read or write that follows. */
     if (events & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
-        why = pump(c, in_dir);
+        why = pump(c, in_dir, now);
     }
     if (!why && (events & (EPOLLOUT | EPOLLERR | EPOLLHUP))) {
         why = flush(c, out_dir);
@@ -243,6 +330,9 @@ static void after(struct pd_conn *c, const char *why)
     if (!why) {
         why = update(c);
     }
+    if (!why) {
+        why = arm_timer(c);
+    }
     if (why) {
         pd_conn_close(c, why);
     }
@@ -250,11 +340,10 @@ static void after(struct pd_conn *c, const char *why)
 
 void pd_conn_event(struct pd_conn *c, struct pd_handle *h, uint32_t events, uint64_t now)
 {
-    (void)now;
     if (c->closed) {
         return;
     }
-    after(c, handle_event(c, h, events));
+    after(c, handle_event(c, h, events, now));
 }
 
 void pd_conn_timer(struct pd_conn *c, uint64_t now)
@@ -262,6 +351,13 @@ void pd_conn_timer(struct pd_conn *c, uint64_t now)
     if (c->connecting && c->connect_deadline <= now) {
         pd_conn_close(c, "connect_timeout");
         return;
+    }
+    for (int dir = 0; dir < 2; dir++) {
+        if (c->throttled_to[dir] && c->throttled_to[dir] <= now) {
+            /* Interest is level-triggered: re-enabling EPOLLIN in after()
+             * brings the next read if data is waiting. */
+            c->throttled_to[dir] = 0;
+        }
     }
     after(c, NULL);
 }
@@ -340,7 +436,7 @@ static const char *connect_upstream(struct pd_conn *c, uint64_t now)
         errno != EINPROGRESS) {
         return errno == ECONNREFUSED ? "upstream_refused" : "upstream_unreachable";
     }
-    return arm_timer(c);
+    return NULL;
 }
 
 void pd_log_reject(struct pd_listener *l, const char *listener, const char *peer,

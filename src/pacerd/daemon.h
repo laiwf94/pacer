@@ -49,6 +49,8 @@ struct pd_listener {
     uint32_t index;
     _Atomic uint32_t conns; /* open connections across all workers */
     pacer_table *ip_conns;  /* per-client holds and new-connection rate */
+    pacer_table *ip_bytes;  /* per-client bytes per second, both directions */
+    pacer_gcra bytes;       /* the listener's bytes per second */
     struct pd_log_limit reject_log;
 };
 
@@ -83,6 +85,7 @@ struct pd_conn {
     uint64_t bytes[2];
     uint64_t start_ns;
     uint64_t connect_deadline;
+    uint64_t throttled_to[2]; /* reading the direction's source waits until then */
     struct pd_timer timer;
     char peer[64];
 };
@@ -100,6 +103,7 @@ struct pd_worker {
     struct pd_conn *dead;  /* closed this batch; events may still point here */
     uint32_t nconns;
     int draining;
+    uint64_t now;              /* clock read once per loop iteration */
     int reserve_fd;            /* spare fd, released to shed a connection at EMFILE */
     uint64_t accept_paused_to; /* accepting resumes at this time; 0 when running */
 };

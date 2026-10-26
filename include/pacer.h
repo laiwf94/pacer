@@ -110,6 +110,16 @@ uint64_t pacer_gcra_remaining(pacer_gcra *g, uint64_t now_ns);
 uint64_t pacer_gcra_take_upto(pacer_gcra *g, uint64_t now_ns, uint64_t max, pacer_decision *d);
 
 /*
+ * Like take_upto, but grant nothing unless at least `min` tokens are
+ * available; then d->retry_after_ns says when `min` will be. Several
+ * consumers sharing one limiter use a min so that none of them can keep
+ * the others out by taking every token the moment it appears. A min above
+ * the burst is lowered to the burst.
+ */
+uint64_t pacer_gcra_take_range(pacer_gcra *g, uint64_t now_ns, uint64_t min, uint64_t max,
+                               pacer_decision *d);
+
+/*
  * Give back `tokens` previously granted and not used. The state never moves
  * before `now_ns`, so a refund cannot create more than a full bucket.
  */
@@ -192,6 +202,10 @@ int pacer_table_take(pacer_table *t, const void *key, size_t len, uint64_t now_n
  */
 int pacer_table_take_upto(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
                           uint64_t max, pacer_decision *d);
+
+/* take_range for one key; see pacer_gcra_take_range. */
+int pacer_table_take_range(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
+                           uint64_t min, uint64_t max, pacer_decision *d);
 
 /* Hand back unused tokens for `key`. Unknown keys are ignored: an evicted
  * key is already at a full bucket. */

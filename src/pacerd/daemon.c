@@ -105,22 +105,33 @@ static void free_listeners(struct pd_daemon *d)
 {
     for (uint32_t i = 0; i < d->nlisteners; i++) {
         pacer_table_destroy(d->listeners[i].ip_conns);
+        pacer_table_destroy(d->listeners[i].ip_bytes);
         d->listeners[i].ip_conns = NULL;
+        d->listeners[i].ip_bytes = NULL;
     }
 }
 
-/* With no per-client connection rate configured, the table still counts
- * holds; this rate never denies. */
-static pacer_rate conn_rate(const struct pd_listener_conf *lc)
+/* A limit that is switched off still gets a limiter so a reload can switch
+ * it on in place; the proxy skips limiters that are off. */
+static pacer_rate rate_or_unlimited(const struct pd_rate_opt *opt)
 {
     pacer_rate unlimited = {1000000000ull, 1000000000ull, 1000000000ull};
-    return lc->per_ip_conn_rate.on ? lc->per_ip_conn_rate.rate : unlimited;
+    return opt->on ? opt->rate : unlimited;
 }
 
 static int setup_limits(const struct pd_listener_conf *lc, struct pd_listener *l)
 {
-    pacer_table_config tc = {lc->table_size, 0, conn_rate(lc), NULL, lc->table_full};
+    pacer_table_config tc = {lc->table_size, 0, rate_or_unlimited(&lc->per_ip_conn_rate), NULL,
+                             lc->table_full};
     int rc = pacer_table_create(&tc, &l->ip_conns);
+    if (rc == PACER_OK) {
+        tc.rate = rate_or_unlimited(&lc->per_ip_bandwidth);
+        rc = pacer_table_create(&tc, &l->ip_bytes);
+    }
+    if (rc == PACER_OK) {
+        pacer_rate r = rate_or_unlimited(&lc->bandwidth);
+        rc = pacer_gcra_init(&l->bytes, &r);
+    }
     if (rc != PACER_OK) {
         struct pd_log_line line;
         pd_log_begin(&line, PD_LOG_ERROR, "cannot create client table");

@@ -377,6 +377,12 @@ int pacer_table_take(pacer_table *t, const void *key, size_t len, uint64_t now_n
 int pacer_table_take_upto(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
                           uint64_t max, pacer_decision *d)
 {
+    return pacer_table_take_range(t, key, len, now_ns, 1, max, d);
+}
+
+int pacer_table_take_range(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
+                           uint64_t min, uint64_t max, pacer_decision *d)
+{
     *d = (pacer_decision){0, 0, 0};
     if (!key_ok(key, len)) {
         return PACER_EINVAL;
@@ -392,7 +398,7 @@ int pacer_table_take_upto(pacer_table *t, const void *key, size_t len, uint64_t 
     int rc = PACER_EFULL;
     if (e) {
         uint64_t next = 0;
-        if (pacer_step_upto(e->tat, now, max, iv, tol, &next, d) != 0) {
+        if (pacer_step_range(e->tat, now, min, max, iv, tol, &next, d) != 0) {
             e->tat = next;
         }
         rc = PACER_OK;

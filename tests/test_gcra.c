@@ -235,3 +235,22 @@ TEST(gcra_reconfigure_keeps_debt_in_time)
     pacer_rate bad = {0, SEC, 1};
     CHECK_EQ_INT(pacer_gcra_reconfigure(&g, &bad), PACER_EINVAL);
 }
+
+TEST(gcra_take_range_waits_for_the_minimum)
+{
+    pacer_gcra g;
+    pacer_rate r = {1000, SEC, 100};
+    pacer_gcra_init(&g, &r);
+    pacer_decision d;
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 95, NULL), 95);
+    /* 5 left: a minimum of 10 is not met; 10 are ready 5 ms later. */
+    CHECK_EQ_U64(pacer_gcra_take_range(&g, SEC, 10, 50, &d), 0);
+    CHECK_EQ_U64(d.remaining, 5);
+    CHECK_EQ_U64(d.retry_after_ns, 5 * MS);
+    CHECK_EQ_U64(pacer_gcra_take_range(&g, SEC + 5 * MS, 10, 50, &d), 10);
+    /* A minimum above the burst is lowered to the burst. */
+    CHECK_EQ_U64(pacer_gcra_take_range(&g, 10 * SEC, 1000, 1000, &d), 100);
+    /* A minimum of 0 behaves like 1. */
+    CHECK_EQ_U64(pacer_gcra_take_range(&g, 10 * SEC, 0, 5, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, MS);
+}
