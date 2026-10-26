@@ -159,3 +159,75 @@ TEST(strerror_covers_every_code)
     CHECK(strcmp(pacer_strerror(PACER_ERANGE), "cost exceeds burst") == 0);
     CHECK(strcmp(pacer_strerror(12345), "unknown error") == 0);
 }
+
+TEST(gcra_take_upto_grants_what_is_available)
+{
+    pacer_gcra g;
+    pacer_rate r = {1000, SEC, 100};
+    pacer_gcra_init(&g, &r);
+    pacer_decision d;
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 60, &d), 60);
+    CHECK_EQ_U64(d.remaining, 40);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 60, &d), 40);
+    CHECK_EQ_U64(d.remaining, 0);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 60, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, MS);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC + MS, 60, NULL), 1);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC + 11 * MS, 60, NULL), 10);
+}
+
+TEST(gcra_take_upto_zero_asks_for_nothing)
+{
+    pacer_gcra g;
+    pacer_rate r = {10, SEC, 1};
+    pacer_gcra_init(&g, &r);
+    pacer_decision d;
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 0, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, 0);
+    CHECK_EQ_U64(d.remaining, 1);
+}
+
+TEST(gcra_refund_restores_state)
+{
+    pacer_gcra g;
+    pacer_rate r = {1000, SEC, 100};
+    pacer_gcra_init(&g, &r);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 100, NULL), 100);
+    pacer_gcra_refund(&g, SEC, 30);
+    CHECK_EQ_U64(pacer_gcra_remaining(&g, SEC), 30);
+    pacer_gcra_refund(&g, SEC, 70);
+    CHECK_EQ_U64(pacer_gcra_remaining(&g, SEC), 100);
+}
+
+TEST(gcra_refund_never_exceeds_a_full_bucket)
+{
+    pacer_gcra g;
+    pacer_rate r = {1000, SEC, 100};
+    pacer_gcra_init(&g, &r);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 10, NULL), 10);
+    pacer_gcra_refund(&g, SEC, 500);
+    CHECK_EQ_U64(pacer_gcra_remaining(&g, SEC), 100);
+    pacer_gcra_refund(&g, SEC, UINT64_MAX);
+    CHECK_EQ_U64(pacer_gcra_remaining(&g, SEC), 100);
+    /* Refunding into an idle limiter changes nothing. */
+    pacer_gcra_refund(&g, 5 * SEC, 10);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, 5 * SEC, 1000, NULL), 100);
+}
+
+TEST(gcra_reconfigure_keeps_debt_in_time)
+{
+    pacer_gcra g;
+    pacer_rate slow = {1, SEC, 1};
+    pacer_gcra_init(&g, &slow);
+    CHECK_EQ_INT(pacer_gcra_take(&g, SEC, 1, NULL), 1);
+    pacer_rate fast = {1000, SEC, 1};
+    CHECK_EQ_INT(pacer_gcra_reconfigure(&g, &fast), PACER_OK);
+    pacer_decision d;
+    /* The client owed one second at the old rate; that wait still stands. */
+    CHECK_EQ_INT(pacer_gcra_take(&g, SEC, 1, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, SEC);
+    CHECK_EQ_INT(pacer_gcra_take(&g, 2 * SEC - 1, 1, NULL), 0);
+    CHECK_EQ_INT(pacer_gcra_take(&g, 2 * SEC, 1, NULL), 1);
+    pacer_rate bad = {0, SEC, 1};
+    CHECK_EQ_INT(pacer_gcra_reconfigure(&g, &bad), PACER_EINVAL);
+}

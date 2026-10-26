@@ -96,4 +96,26 @@ int pacer_gcra_take(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decisio
 /* Tokens available at `now_ns` without taking any. */
 uint64_t pacer_gcra_remaining(pacer_gcra *g, uint64_t now_ns);
 
+/*
+ * Take as many tokens as are available, up to `max`. Returns the number
+ * granted. When it is 0, d->retry_after_ns says when one token will be
+ * ready. Used for byte shaping, where a read is sized by the grant and the
+ * unused part handed back with pacer_gcra_refund. `d` may be NULL.
+ */
+uint64_t pacer_gcra_take_upto(pacer_gcra *g, uint64_t now_ns, uint64_t max, pacer_decision *d);
+
+/*
+ * Give back `tokens` previously granted and not used. The state never moves
+ * before `now_ns`, so a refund cannot create more than a full bucket.
+ */
+void pacer_gcra_refund(pacer_gcra *g, uint64_t now_ns, uint64_t tokens);
+
+/*
+ * Change the rate while other threads keep taking. Debt is kept as time:
+ * a client that had to wait 2 s still waits 2 s. A take running at the same
+ * moment may combine the old interval with the new tolerance; the result
+ * is bounded by the larger of the two configurations.
+ */
+int pacer_gcra_reconfigure(pacer_gcra *g, const pacer_rate *r);
+
 #endif

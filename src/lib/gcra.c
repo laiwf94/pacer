@@ -91,3 +91,68 @@ uint64_t pacer_gcra_remaining(pacer_gcra *g, uint64_t now_ns)
     uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
     return pacer_avail(tat > now ? tat - now : 0, tol, iv);
 }
+
+uint64_t pacer_gcra_take_upto(pacer_gcra *g, uint64_t now_ns, uint64_t max, pacer_decision *d)
+{
+    pacer_decision local;
+    if (!d) {
+        d = &local;
+    }
+    uint64_t iv = atomic_load_explicit(&g->interval, memory_order_relaxed);
+    uint64_t tol = atomic_load_explicit(&g->tolerance, memory_order_relaxed);
+    uint64_t now = pacer_ticks(now_ns);
+    uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
+    for (;;) {
+        uint64_t base = tat > now ? tat : now;
+        uint64_t avail = pacer_avail(base - now, tol, iv);
+        uint64_t grant = avail < max ? avail : max;
+        if (grant == 0) {
+            d->granted = 0;
+            d->remaining = avail;
+            /* One token fits once base - now drops to tol - iv. When max is
+             * 0 nothing was asked for, so there is nothing to wait for. */
+            d->retry_after_ns = max == 0 ? 0 : pacer_ticks_to_ns_ceil(base - now + iv - tol);
+            return 0;
+        }
+        uint64_t next = base + grant * iv;
+        if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            d->granted = grant;
+            d->remaining = avail - grant;
+            d->retry_after_ns = 0;
+            return grant;
+        }
+    }
+}
+
+void pacer_gcra_refund(pacer_gcra *g, uint64_t now_ns, uint64_t tokens)
+{
+    uint64_t iv = atomic_load_explicit(&g->interval, memory_order_relaxed);
+    uint64_t tol = atomic_load_explicit(&g->tolerance, memory_order_relaxed);
+    uint64_t now = pacer_ticks(now_ns);
+    /* Refunding more than a bucket's worth is the same as a full bucket. */
+    uint64_t back = tokens > tol / iv ? tol : tokens * iv;
+    uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
+    for (;;) {
+        if (tat <= now) {
+            return;
+        }
+        uint64_t next = tat - now > back ? tat - back : now;
+        if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+int pacer_gcra_reconfigure(pacer_gcra *g, const pacer_rate *r)
+{
+    uint64_t iv = 0, tol = 0;
+    int rc = pacer_rate_ticks(r, &iv, &tol);
+    if (rc != PACER_OK) {
+        return rc;
+    }
+    atomic_store_explicit(&g->interval, iv, memory_order_relaxed);
+    atomic_store_explicit(&g->tolerance, tol, memory_order_relaxed);
+    return PACER_OK;
+}
