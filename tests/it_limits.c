@@ -3,6 +3,8 @@
 #include "test.h"
 #include "upstream.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,9 +75,15 @@ TEST(limits_per_ip_concurrent_connections)
     int other = tcp_connect_from(port, "127.0.0.2");
     CHECK(works(other));
     close(other);
-    /* Closing one frees a slot for the first address. */
+    /* Closing one frees a slot for the first address once the proxy has
+     * seen it go. */
+    struct sockaddr_in local = {0};
+    socklen_t llen = sizeof local;
+    CHECK_EQ_INT(getsockname(fds[0], (struct sockaddr *)&local, &llen), 0);
+    char line[64];
+    snprintf(line, sizeof line, "peer=127.0.0.1:%u reason=done", ntohs(local.sin_port));
     close(fds[0]);
-    CHECK(proc_wait_log(&p, "reason=done", &from, 3000));
+    CHECK(proc_wait_log(&p, line, &from, 3000));
     int again = tcp_connect(port);
     CHECK(works(again));
     close(again);
