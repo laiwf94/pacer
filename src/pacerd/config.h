@@ -8,6 +8,7 @@
 #define PACERD_CONFIG_H
 
 #include "pacer.h"
+#include "pacerd/log.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,8 +21,6 @@
 #define PD_CONFIG_MAX_SIZE (1 << 20)
 #define PD_LINE_MAX        1024
 #define PD_ERR_MAX         256
-
-enum { PD_LOG_DEBUG, PD_LOG_INFO, PD_LOG_WARN, PD_LOG_ERROR };
 
 struct pd_addr {
     struct sockaddr_storage ss;
