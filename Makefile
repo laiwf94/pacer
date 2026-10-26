@@ -30,11 +30,13 @@ else
 endif
 
 LIB_SRC   := $(wildcard src/lib/*.c)
+PD_SRC    := $(filter-out src/pacerd/main.c,$(wildcard src/pacerd/*.c))
 TEST_SRC  := $(wildcard tests/test_*.c) tests/test_main.c
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/%.o)
+PD_OBJ    := $(PD_SRC:%.c=$(BUILD)/%.o)
 TEST_OBJ  := $(sort $(TEST_SRC:%.c=$(BUILD)/%.o))
 
-ALL_C     := $(LIB_SRC) $(sort $(TEST_SRC))
+ALL_C     := $(LIB_SRC) $(PD_SRC) $(sort $(TEST_SRC))
 ALL_SRC   := $(ALL_C) $(wildcard include/*.h src/*/*.h tests/*.h)
 
 .PHONY: all lib test run-tests check format format-check tidy coverage clean require-linux
@@ -51,7 +53,11 @@ $(BUILD)/libpacer.a: $(LIB_OBJ)
 	@rm -f $@
 	ar rcs $@ $^
 
-$(BUILD)/unit: $(TEST_OBJ) $(BUILD)/libpacer.a
+$(BUILD)/libpacerd.a: $(PD_OBJ)
+	@rm -f $@
+	ar rcs $@ $^
+
+$(BUILD)/unit: $(TEST_OBJ) $(BUILD)/libpacerd.a $(BUILD)/libpacer.a
 	$(CC) $(LDFLAGS) -o $@ $^
 
 run-tests: $(BUILD)/unit
@@ -96,4 +102,4 @@ check: require-linux
 clean:
 	rm -rf build
 
--include $(LIB_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+-include $(LIB_OBJ:.o=.d) $(PD_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
