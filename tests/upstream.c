@@ -137,6 +137,11 @@ static void serve(struct upstream *u, int fd)
         }
         break;
     }
+    case UP_STALL:
+        while (!atomic_load(&u->stop)) {
+            usleep(10 * 1000);
+        }
+        break;
     case UP_RESET: {
         uint64_t got = 0;
         while (got < u->param) {

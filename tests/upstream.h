@@ -12,6 +12,7 @@ enum upstream_mode {
     UP_HASH,   /* read to EOF, reply "<fnv64 hex> <count>\n", close */
     UP_SOURCE, /* send `param` pattern bytes, then close */
     UP_RESET,  /* read `param` bytes, then reset the connection */
+    UP_STALL,  /* accept, then neither read nor write until stopped */
 };
 
 struct upstream {
