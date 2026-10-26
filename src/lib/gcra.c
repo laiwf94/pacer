@@ -18,6 +18,8 @@ const char *pacer_strerror(int err)
         return "table full";
     case PACER_ENOENT:
         return "no such key";
+    case PACER_ELIMIT:
+        return "concurrency limit reached";
     default:
         return "unknown error";
     }

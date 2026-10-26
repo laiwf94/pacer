@@ -336,3 +336,96 @@ TEST(table_lru_survives_heavy_churn)
     CHECK_EQ_U64(st.inserts, st.entries + st.removals + st.reclaims + st.evictions);
     pacer_table_destroy(t);
 }
+
+TEST(table_hold_caps_concurrency)
+{
+    pacer_table_config cfg = {100, 1, {1000, SEC, 100}, fixed_key, PACER_FULL_DENY};
+    pacer_table *t = NULL;
+    CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_OK);
+    for (int i = 0; i < 3; i++) {
+        CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC, 3, NULL), 1);
+    }
+    pacer_decision d;
+    CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC, 3, &d), PACER_ELIMIT);
+    CHECK_EQ_INT(pacer_table_hold(t, "other", 5, SEC, 3, NULL), 1);
+    CHECK_EQ_INT(pacer_table_release(t, "ip", 2), PACER_OK);
+    CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC, 3, NULL), 1);
+    pacer_table_stats st;
+    pacer_table_get_stats(t, &st);
+    CHECK_EQ_U64(st.holds, 4);
+    /* The cap check costs no token: 4 grants out of a burst of 100. */
+    CHECK_EQ_U64(pacer_table_take(t, "ip", 2, SEC, 96, NULL), 1);
+    pacer_table_destroy(t);
+}
+
+TEST(table_hold_respects_the_rate)
+{
+    pacer_table_config cfg = {100, 1, {10, SEC, 2}, fixed_key, PACER_FULL_DENY};
+    pacer_table *t = NULL;
+    CHECK_EQ_INT(pacer_table_create(&cfg, &t), PACER_OK);
+    CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC, 100, NULL), 1);
+    CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC, 100, NULL), 1);
+    pacer_decision d;
+    CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC, 100, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, SEC / 10);
+    CHECK_EQ_INT(pacer_table_hold(t, "ip", 2, SEC + SEC / 10, 100, NULL), 1);
+    CHECK_EQ_INT(pacer_table_hold(t, "", 0, SEC, 1, NULL), PACER_EINVAL);
+    pacer_table_destroy(t);
+}
+
+TEST(table_release_without_hold_is_an_error)
+{
+    pacer_table *t = make_policy_table(16, PACER_FULL_DENY);
+    CHECK_EQ_INT(pacer_table_release(t, "nobody", 6), PACER_ENOENT);
+    CHECK_EQ_INT(take_key(t, 1, SEC), 1);
+    char k[32];
+    size_t n = key_name(k, sizeof k, 1);
+    CHECK_EQ_INT(pacer_table_release(t, k, n), PACER_ENOENT);
+    CHECK_EQ_INT(pacer_table_release(t, "", 0), PACER_EINVAL);
+    pacer_table_destroy(t);
+}
+
+TEST(table_held_entries_are_never_dropped)
+{
+    pacer_table *t = make_policy_table(16, PACER_FULL_EVICT);
+    char k[32];
+    for (unsigned i = 0; i < 16; i++) {
+        size_t n = key_name(k, sizeof k, i);
+        CHECK_EQ_INT(pacer_table_hold(t, k, n, SEC, 10, NULL), 1);
+    }
+    /* Long after their buckets refilled, held entries are neither idle nor
+     * evictable, so a new key is refused even under EVICT. */
+    CHECK_EQ_INT(take_key(t, 100, 100 * SEC), PACER_EFULL);
+    CHECK_EQ_U64(pacer_table_sweep(t, 100 * SEC, 1), 0);
+    /* Releasing one makes it idle and reclaimable. */
+    size_t n = key_name(k, sizeof k, 5);
+    CHECK_EQ_INT(pacer_table_release(t, k, n), PACER_OK);
+    CHECK_EQ_INT(take_key(t, 100, 100 * SEC), 1);
+    pacer_table_stats st;
+    pacer_table_get_stats(t, &st);
+    CHECK_EQ_U64(st.reclaims, 1);
+    CHECK_EQ_U64(st.holds, 15);
+    /* Removing a held key drops its holds from the count. */
+    n = key_name(k, sizeof k, 6);
+    CHECK_EQ_INT(pacer_table_remove(t, k, n), PACER_OK);
+    pacer_table_get_stats(t, &st);
+    CHECK_EQ_U64(st.holds, 14);
+    CHECK_EQ_INT(pacer_table_check(t), 0);
+    pacer_table_destroy(t);
+}
+
+TEST(table_evict_skips_held_entries)
+{
+    pacer_table *t = make_policy_table(16, PACER_FULL_EVICT);
+    char k[32];
+    size_t n = key_name(k, sizeof k, 0);
+    CHECK_EQ_INT(pacer_table_hold(t, k, n, SEC, 10, NULL), 1);
+    for (unsigned i = 1; i < 16; i++) {
+        CHECK_EQ_INT(take_key(t, i, SEC), 1);
+    }
+    /* Key 0 is the coldest but held, so key 1 is evicted instead. */
+    CHECK_EQ_INT(take_key(t, 100, SEC), 1);
+    CHECK_EQ_INT(take_key(t, 1, SEC), 1);
+    CHECK_EQ_INT(pacer_table_release(t, k, n), PACER_OK);
+    pacer_table_destroy(t);
+}

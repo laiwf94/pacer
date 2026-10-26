@@ -24,7 +24,7 @@ struct entry {
     uint64_t tat;
     uint32_t prev; /* LRU neighbours, as slot indexes in the same shard */
     uint32_t next;
-    uint32_t pad;
+    uint32_t holds;
     uint8_t keylen; /* 0 marks an empty slot */
     uint8_t key[PACER_KEY_MAX];
 };
@@ -44,6 +44,7 @@ struct shard {
     uint64_t reclaims;
     uint64_t evictions;
     uint64_t rejections;
+    uint64_t holds;
 } __attribute__((aligned(CACHE_LINE)));
 
 struct pacer_table {
@@ -269,7 +270,7 @@ static void delete_at(struct shard *s, uint32_t i)
 
 static int idle(const struct entry *e, uint64_t now)
 {
-    return e->tat <= now;
+    return e->tat <= now && e->holds == 0;
 }
 
 /*
@@ -287,10 +288,17 @@ static int make_room(struct shard *s, int policy, uint64_t now)
         }
         i = s->slots[i].prev;
     }
-    if (policy == PACER_FULL_EVICT && s->tail != NIL) {
-        delete_at(s, s->tail);
-        s->evictions++;
-        return 1;
+    if (policy != PACER_FULL_EVICT) {
+        return 0;
+    }
+    i = s->tail;
+    for (int n = 0; n < RECLAIM_SCAN && i != NIL; n++) {
+        if (s->slots[i].holds == 0) {
+            delete_at(s, i);
+            s->evictions++;
+            return 1;
+        }
+        i = s->slots[i].prev;
     }
     return 0;
 }
@@ -317,6 +325,7 @@ static struct entry *find_or_insert(struct shard *s, int policy, uint64_t now, u
     }
     e->hash = hash;
     e->tat = 0;
+    e->holds = 0;
     e->keylen = (uint8_t)len;
     memcpy(e->key, key, len);
     lru_push_head(s, i);
@@ -412,6 +421,61 @@ void pacer_table_refund(pacer_table *t, const void *key, size_t len, uint64_t no
     (void)pthread_mutex_unlock(&s->mu);
 }
 
+int pacer_table_hold(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
+                     uint32_t max_holds, pacer_decision *d)
+{
+    pacer_decision local;
+    if (!d) {
+        d = &local;
+    }
+    *d = (pacer_decision){0, 0, 0};
+    if (!key_ok(key, len)) {
+        return PACER_EINVAL;
+    }
+    uint64_t iv = 0, tol = 0;
+    load_rate(t, &iv, &tol);
+    uint64_t now = pacer_ticks(now_ns);
+    uint64_t hash = pacer_siphash24(t->hash_key, key, len);
+    struct shard *s = shard_for(t, hash);
+
+    (void)pthread_mutex_lock(&s->mu);
+    struct entry *e = find_or_insert(s, t->full_policy, now, hash, key, len);
+    int rc = PACER_EFULL;
+    if (e && e->holds >= max_holds) {
+        rc = PACER_ELIMIT;
+    } else if (e) {
+        uint64_t next = 0;
+        rc = pacer_step_take(e->tat, now, 1, iv, tol, &next, d);
+        if (rc == 1) {
+            e->tat = next;
+            e->holds++;
+            s->holds++;
+        }
+    }
+    (void)pthread_mutex_unlock(&s->mu);
+    return rc;
+}
+
+int pacer_table_release(pacer_table *t, const void *key, size_t len)
+{
+    if (!key_ok(key, len)) {
+        return PACER_EINVAL;
+    }
+    uint64_t hash = pacer_siphash24(t->hash_key, key, len);
+    struct shard *s = shard_for(t, hash);
+
+    (void)pthread_mutex_lock(&s->mu);
+    struct entry *e = &s->slots[probe(s, hash, key, len)];
+    int rc = PACER_ENOENT;
+    if (e->keylen != 0 && e->holds > 0) {
+        e->holds--;
+        s->holds--;
+        rc = PACER_OK;
+    }
+    (void)pthread_mutex_unlock(&s->mu);
+    return rc;
+}
+
 int pacer_table_remove(pacer_table *t, const void *key, size_t len)
 {
     if (!key_ok(key, len)) {
@@ -424,6 +488,7 @@ int pacer_table_remove(pacer_table *t, const void *key, size_t len)
     uint32_t i = probe(s, hash, key, len);
     int rc = PACER_ENOENT;
     if (s->slots[i].keylen != 0) {
+        s->holds -= s->slots[i].holds;
         delete_at(s, i);
         s->removals++;
         rc = PACER_OK;
@@ -492,6 +557,7 @@ void pacer_table_get_stats(pacer_table *t, pacer_table_stats *out)
         out->reclaims += s->reclaims;
         out->evictions += s->evictions;
         out->rejections += s->rejections;
+        out->holds += s->holds;
         (void)pthread_mutex_unlock(&s->mu);
     }
 }

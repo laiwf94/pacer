@@ -36,6 +36,7 @@ enum {
     PACER_ENOMEM = -3, /* allocation failed */
     PACER_EFULL = -4,  /* keyed table full; the key was not admitted */
     PACER_ENOENT = -5, /* key not present */
+    PACER_ELIMIT = -6, /* concurrency limit for the key reached */
 };
 
 /* Short description of an error code, never NULL. */
@@ -140,11 +141,12 @@ typedef struct pacer_table pacer_table;
 
 /*
  * What to do when a new key arrives and its shard is full. The table first
- * reclaims an idle entry (one whose bucket has refilled, which is identical
- * to a fresh entry, so dropping it changes no decision). If none of the
- * least recently used entries is idle:
+ * reclaims an idle entry (one whose bucket has refilled and that has no
+ * holds, which is identical to a fresh entry, so dropping it changes no
+ * decision). If none of the least recently used entries is idle:
  *   PACER_FULL_DENY refuses the new key and keeps everyone's debt;
- *   PACER_FULL_EVICT drops the least recently used entry and its debt.
+ *   PACER_FULL_EVICT drops the least recently used entry without holds,
+ *   and its debt. Entries with holds are never dropped.
  * DENY is the safe default against an attacker spraying source addresses:
  * EVICT would let them reset other clients' limits.
  */
@@ -166,6 +168,7 @@ typedef struct pacer_table_stats {
     uint64_t reclaims;   /* idle keys dropped to make room */
     uint64_t evictions;  /* keys with debt dropped under PACER_FULL_EVICT */
     uint64_t rejections; /* keys refused because the table was full */
+    uint64_t holds;      /* holds currently open across all keys */
 } pacer_table_stats;
 
 /* Create a table. On success *out owns the table; free it with destroy. */
@@ -195,7 +198,22 @@ int pacer_table_take_upto(pacer_table *t, const void *key, size_t len, uint64_t 
 void pacer_table_refund(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
                         uint64_t tokens);
 
-/* Remove `key`. Returns PACER_OK or PACER_ENOENT. */
+/*
+ * Concurrency holds: count how many things (connections) a key has open.
+ * hold admits one more if the key has fewer than `max_holds` and a take of
+ * one token is granted, so a single call enforces both a concurrency cap and
+ * an arrival rate. Returns 1 admitted, 0 rate-denied (see d), PACER_ELIMIT
+ * at the cap (no token taken), or an error as for take. Every admitted hold
+ * must be matched by exactly one release. `d` may be NULL.
+ */
+int pacer_table_hold(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
+                     uint32_t max_holds, pacer_decision *d);
+
+/* Drop one hold. Returns PACER_OK, or PACER_ENOENT if the key has none,
+ * which means the caller released more than it held. */
+int pacer_table_release(pacer_table *t, const void *key, size_t len);
+
+/* Remove `key`, holds and all. Returns PACER_OK or PACER_ENOENT. */
 int pacer_table_remove(pacer_table *t, const void *key, size_t len);
 
 /* Change the per-key rate for every key, keeping debt as time. */
