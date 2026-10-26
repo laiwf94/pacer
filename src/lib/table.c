@@ -388,6 +388,10 @@ int pacer_table_take_upto(pacer_table *t, const void *key, size_t len, uint64_t 
 int pacer_table_take_range(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
                            uint64_t min, uint64_t max, pacer_decision *d)
 {
+    /* The grant is only reported through d, so it is required. */
+    if (!d) {
+        return PACER_EINVAL;
+    }
     *d = (pacer_decision){0, 0, 0};
     if (!key_ok(key, len)) {
         return PACER_EINVAL;

@@ -78,6 +78,7 @@ TEST(table_rejects_bad_keys_and_costs)
     CHECK_EQ_INT(pacer_table_take(t, long_key, PACER_KEY_MAX, SEC, 1, NULL), 1);
     CHECK_EQ_INT(pacer_table_take(t, "a", 1, SEC, 3, NULL), PACER_ERANGE);
     CHECK_EQ_INT(pacer_table_take_upto(t, "", 0, SEC, 1, &d), PACER_EINVAL);
+    CHECK_EQ_INT(pacer_table_take_upto(t, "a", 1, SEC, 1, NULL), PACER_EINVAL);
     CHECK_EQ_INT(pacer_table_remove(t, "", 0), PACER_EINVAL);
     pacer_table_refund(t, "", 0, SEC, 1);
     pacer_table_destroy(t);

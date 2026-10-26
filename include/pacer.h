@@ -199,6 +199,7 @@ int pacer_table_take(pacer_table *t, const void *key, size_t len, uint64_t now_n
 /*
  * Take up to `max` tokens for `key`. Returns PACER_OK with the grant in
  * d->granted (0 means wait d->retry_after_ns), or an error as for take.
+ * `d` is required here: a NULL `d` returns PACER_EINVAL.
  */
 int pacer_table_take_upto(pacer_table *t, const void *key, size_t len, uint64_t now_ns,
                           uint64_t max, pacer_decision *d);
