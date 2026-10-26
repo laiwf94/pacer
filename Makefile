@@ -48,11 +48,13 @@ PD_OBJ    := $(PD_SRC:%.c=$(BUILD)/%.o)
 TEST_OBJ  := $(sort $(TEST_SRC:%.c=$(BUILD)/%.o))
 IT_OBJ    := $(sort $(IT_SRC:%.c=$(BUILD)/%.o))
 
+FUZZ_SRC  := $(wildcard fuzz/fuzz_*.c)
 ALL_C     := $(LIB_SRC) $(PD_ALL) src/pacerd/main.c src/pacerctl/pacerctl.c \
-             $(sort $(TEST_SRC) $(IT_SRC))
+             $(sort $(TEST_SRC) $(IT_SRC)) $(FUZZ_SRC)
 ALL_SRC   := $(ALL_C) $(wildcard include/*.h src/*/*.h tests/*.h)
 
-.PHONY: all lib test run-tests check format format-check tidy coverage clean require-linux
+.PHONY: all lib test run-tests check format format-check tidy coverage clean require-linux \
+        fuzz fuzz-smoke
 
 all: lib $(BINS)
 
@@ -114,6 +116,30 @@ coverage:
 	$(MAKE) VARIANT=cov run-tests
 	scripts/coverage.sh build/cov 90 build/cov/unit build/cov/pacerd build/cov/pacerctl
 
+# libFuzzer targets over the parsers that read outside input. They link the
+# portable sources directly, built with the fuzzer and sanitizers.
+FUZZ_TIME  ?= 10
+FUZZ_FLAGS := -std=c17 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all
+FUZZ_DEPS  := $(LIB_SRC) src/pacerd/config.c src/pacerd/log.c src/pacerd/util.c \
+              src/pacerd/admin_proto.c
+FUZZ_BINS  := $(FUZZ_SRC:fuzz/%.c=build/fuzz/%)
+
+build/fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_DEPS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(FUZZ_FLAGS) $(WARN) -o $@ $^
+
+fuzz: $(FUZZ_BINS)
+
+# Replay the seed corpus, then fuzz each target for FUZZ_TIME seconds in a
+# scratch copy of its corpus so new inputs never land in the tree.
+fuzz-smoke: fuzz
+	set -e; for t in config admin; do \
+	  rm -rf build/fuzz/corpus-$$t && cp -r fuzz/corpus/$$t build/fuzz/corpus-$$t; \
+	  dict=""; [ -f fuzz/$$t.dict ] && dict="-dict=fuzz/$$t.dict"; \
+	  build/fuzz/fuzz_$$t -max_total_time=$(FUZZ_TIME) -max_len=8192 -print_final_stats=1 \
+	    $$dict build/fuzz/corpus-$$t 2>&1 | tail -n 12; \
+	done
+
 require-linux:
 ifneq ($(UNAME),Linux)
 	@echo "make check needs Linux (epoll, signalfd, sanitizers). Run: scripts/dev.sh make check" >&2
@@ -127,6 +153,7 @@ check: require-linux
 	$(MAKE) -j$(JOBS) VARIANT=asan run-tests
 	$(MAKE) -j$(JOBS) VARIANT=tsan run-tests
 	$(MAKE) -j$(JOBS) coverage
+	$(MAKE) fuzz-smoke FUZZ_TIME=5
 	@echo "check: all gates passed"
 
 clean:
