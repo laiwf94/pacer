@@ -205,7 +205,7 @@ static int start_workers(struct pd_daemon *d)
     return 0;
 }
 
-static void begin_drain(struct pd_daemon *d, const char *why)
+void pd_daemon_drain(struct pd_daemon *d, const char *why)
 {
     if (atomic_exchange(&d->draining, 1)) {
         return;
@@ -316,24 +316,25 @@ int pd_daemon_reload(struct pd_daemon *d, char *err, size_t errlen)
     return 0;
 }
 
-static void reload(struct pd_daemon *d, const char *source)
+int pd_daemon_reload_logged(struct pd_daemon *d, const char *source, char *err, size_t errlen)
 {
-    char err[PD_ERR_MAX];
     struct pd_log_line l;
     if (atomic_load(&d->draining)) {
+        (void)snprintf(err, errlen, "draining");
         pd_log_msg(PD_LOG_WARN, "reload ignored while draining");
-        return;
+        return -1;
     }
-    if (pd_daemon_reload(d, err, sizeof err) != 0) {
+    if (pd_daemon_reload(d, err, errlen) != 0) {
         pd_log_begin(&l, PD_LOG_ERROR, "reload rejected, keeping the running config");
         pd_log_str(&l, "source", source);
         pd_log_str(&l, "error", err);
         pd_log_end(&l);
-        return;
+        return -1;
     }
     pd_log_begin(&l, PD_LOG_INFO, "reloaded");
     pd_log_str(&l, "source", source);
     pd_log_end(&l);
+    return 0;
 }
 
 static int on_signal(struct pd_daemon *d, int sfd)
@@ -341,42 +342,56 @@ static int on_signal(struct pd_daemon *d, int sfd)
     struct signalfd_siginfo si;
     while (read(sfd, &si, sizeof si) == (ssize_t)sizeof si) {
         if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT) {
-            begin_drain(d, si.ssi_signo == SIGTERM ? "SIGTERM" : "SIGINT");
+            pd_daemon_drain(d, si.ssi_signo == SIGTERM ? "SIGTERM" : "SIGINT");
         } else if (si.ssi_signo == SIGHUP) {
-            reload(d, "SIGHUP");
+            char err[PD_ERR_MAX];
+            (void)pd_daemon_reload_logged(d, "SIGHUP", err, sizeof err);
         }
     }
     return 0;
 }
 
-/* Main thread loop: signals and worker notifications until drained. */
-static int main_loop(struct pd_daemon *d, int sfd)
+/* Main thread loop: signals, worker notifications and the admin socket,
+ * until every worker has finished. */
+static int main_loop(struct pd_daemon *d)
 {
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) {
         log_errno("epoll_create1 failed", NULL, errno);
-        begin_drain(d, "startup failure");
+        atomic_store(&d->failed, 1);
+        pd_daemon_drain(d, "startup failure");
         return 1;
     }
-    struct epoll_event ev = {.events = EPOLLIN, .data.fd = sfd};
-    (void)epoll_ctl(ep, EPOLL_CTL_ADD, sfd, &ev);
-    ev.data.fd = d->main_wake;
-    (void)epoll_ctl(ep, EPOLL_CTL_ADD, d->main_wake, &ev);
+    struct pd_handle *hs[] = {&d->signals, &d->main_wake_h, &d->admin};
+    for (size_t i = 0; i < sizeof hs / sizeof hs[0]; i++) {
+        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = hs[i]};
+        if (hs[i]->fd >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, hs[i]->fd, &ev) != 0) {
+            log_errno("epoll_ctl failed", NULL, errno);
+            atomic_store(&d->failed, 1);
+            pd_daemon_drain(d, "startup failure");
+        }
+    }
 
     int listeners_closed = 0;
     while (atomic_load(&d->workers_running) > 0) {
-        struct epoll_event events[8];
-        int n = epoll_wait(ep, events, 8, -1);
+        struct epoll_event events[16];
+        int timeout = pd_admin_expire(d, pacer_now_ns());
+        int n = epoll_wait(ep, events, 16, timeout);
         for (int i = 0; i < n; i++) {
-            if (events[i].data.fd == sfd) {
-                on_signal(d, sfd);
+            struct pd_handle *h = events[i].data.ptr;
+            if (h->kind == PD_H_SIGNAL) {
+                on_signal(d, h->fd);
+            } else if (h->kind == PD_H_ADMIN_LISTEN) {
+                pd_admin_accept(d, ep);
+            } else if (h->kind == PD_H_ADMIN_CLIENT) {
+                pd_admin_event(d, (struct pd_admin_client *)h);
             } else {
                 uint64_t v = 0;
-                (void)read(d->main_wake, &v, sizeof v);
+                (void)read(h->fd, &v, sizeof v);
             }
         }
         if (atomic_load(&d->failed)) {
-            begin_drain(d, "worker failure");
+            pd_daemon_drain(d, "worker failure");
         }
         /* Once no worker can call accept on them, the listening sockets
          * are closed so new connections are refused at once. */
@@ -393,10 +408,17 @@ static int main_loop(struct pd_daemon *d, int sfd)
 int pd_daemon_run(const char *config_path)
 {
     char err[PD_ERR_MAX];
-    struct pd_daemon d;
+    static struct pd_daemon d;
     memset(&d, 0, sizeof d);
     d.config_path = config_path;
     d.main_wake = -1;
+    d.start_ns = pacer_now_ns();
+    d.admin.kind = PD_H_ADMIN_LISTEN;
+    d.admin.fd = -1;
+    for (int i = 0; i < PD_ADMIN_CLIENTS; i++) {
+        d.admin_clients[i].h.kind = PD_H_ADMIN_CLIENT;
+        d.admin_clients[i].h.fd = -1;
+    }
     d.cfg = pd_cfg_load(config_path, err, sizeof err);
     if (!d.cfg) {
         struct pd_log_line l;
@@ -420,21 +442,24 @@ int pd_daemon_run(const char *config_path)
     int rc = 1;
     int sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     d.main_wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    d.signals = (struct pd_handle){PD_H_SIGNAL, sfd};
+    d.main_wake_h = (struct pd_handle){PD_H_WAKE, d.main_wake};
     if (sfd < 0 || d.main_wake < 0) {
         log_errno("cannot create signal or event fd", NULL, errno);
-    } else if (setup_listeners(&d) == 0 && start_workers(&d) == 0) {
+    } else if (setup_listeners(&d) == 0 && pd_admin_open(&d) == 0 && start_workers(&d) == 0) {
         struct pd_log_line l;
         pd_log_begin(&l, PD_LOG_INFO, "ready");
         pd_log_str(&l, "version", pacer_version());
         pd_log_u64(&l, "workers", d.nworkers);
         pd_log_u64(&l, "listeners", d.nlisteners);
         pd_log_end(&l);
-        rc = main_loop(&d, sfd);
+        rc = main_loop(&d);
     } else {
         atomic_store(&d.failed, 1);
-        begin_drain(&d, "startup failure");
+        pd_daemon_drain(&d, "startup failure");
     }
     join_workers(&d);
+    pd_admin_close(&d);
     close_listeners(&d);
     free_listeners(&d);
     if (rc == 0) {

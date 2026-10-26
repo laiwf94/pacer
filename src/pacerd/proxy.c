@@ -238,6 +238,7 @@ static const char *pump(struct pd_conn *c, int dir, uint64_t now)
     if (grant == 0) {
         c->throttled_to[dir] = now + (retry ? retry : 1);
         c->last_throttle = c->throttled_to[dir];
+        pd_stat_add(c->w, c->li, PD_ST_THROTTLED, 1);
         return NULL;
     }
     ssize_t n = recv(src_fd(c, dir), b->data + b->end, (size_t)grant, 0);
@@ -253,6 +254,7 @@ static const char *pump(struct pd_conn *c, int dir, uint64_t now)
     } else {
         b->end += (uint32_t)n;
         c->bytes[dir] += (uint64_t)n;
+        pd_stat_add(c->w, c->li, dir == PD_UP ? PD_ST_BYTES_UP : PD_ST_BYTES_DOWN, (uint64_t)n);
         c->last_io = now;
         if (c->next_rate_check) {
             pacer_window_add(&c->moved, now, (uint64_t)n);
@@ -424,6 +426,7 @@ void pd_conn_close(struct pd_conn *c, const char *reason)
     pd_log_u64(&l, "ms", (pacer_now_ns() - c->start_ns) / 1000000);
     pd_log_end(&l);
 
+    pd_count(w, c->li, reason);
     pd_heap_remove(&w->timers, &c->timer);
     struct pd_listener *pl = &w->d->listeners[c->li];
     if (c->held && pacer_table_release(pl->ip_conns, c->key, c->keylen) != PACER_OK) {
@@ -487,6 +490,45 @@ static const char *connect_upstream(struct pd_conn *c, uint64_t now)
     return NULL;
 }
 
+static enum pd_stat stat_for(const char *reason)
+{
+    static const struct {
+        const char *reason;
+        enum pd_stat st;
+    } map[] = {
+        {"done", PD_ST_CLOSED_DONE},
+        {"idle_timeout", PD_ST_CLOSED_IDLE},
+        {"slow_client", PD_ST_CLOSED_SLOW},
+        {"connect_timeout", PD_ST_CLOSED_UPSTREAM_FAILED},
+        {"upstream_refused", PD_ST_CLOSED_UPSTREAM_FAILED},
+        {"upstream_unreachable", PD_ST_CLOSED_UPSTREAM_FAILED},
+        {"upstream_socket", PD_ST_CLOSED_UPSTREAM_FAILED},
+        {"client_reset", PD_ST_CLOSED_RESET},
+        {"client_error", PD_ST_CLOSED_RESET},
+        {"upstream_reset", PD_ST_CLOSED_RESET},
+        {"upstream_error", PD_ST_CLOSED_RESET},
+        {"drain_timeout", PD_ST_CLOSED_DRAIN},
+        {"shutdown", PD_ST_CLOSED_DRAIN},
+        {"listener_full", PD_ST_REJ_LISTENER_FULL},
+        {"per_ip_conns", PD_ST_REJ_PER_IP_CONNS},
+        {"per_ip_rate", PD_ST_REJ_PER_IP_RATE},
+        {"table_full", PD_ST_REJ_TABLE_FULL},
+        {"fd_exhausted", PD_ST_REJ_FD_EXHAUSTED},
+        {"fd_exhausted_paused", PD_ST_REJ_FD_EXHAUSTED},
+    };
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) {
+        if (strcmp(map[i].reason, reason) == 0) {
+            return map[i].st;
+        }
+    }
+    return PD_ST_CLOSED_OTHER;
+}
+
+void pd_count(struct pd_worker *w, uint32_t li, const char *reason)
+{
+    pd_stat_add(w, li, stat_for(reason), 1);
+}
+
 void pd_log_reject(struct pd_listener *l, const char *listener, const char *peer,
                    const char *reason, uint64_t now)
 {
@@ -534,10 +576,10 @@ static const char *admit(struct pd_listener *l, const struct pd_listener_conf *l
         return "per_ip_rate";
     case PACER_ELIMIT:
         return "per_ip_conns";
-    case PACER_EFULL:
-        return "table_full";
     default:
-        return "bad_address";
+        /* PACER_EFULL. Accepted TCP peers are always IPv4 or IPv6, so the
+         * key is never invalid. */
+        return "table_full";
     }
 }
 
@@ -555,6 +597,7 @@ void pd_conn_accept(struct pd_worker *w, struct pd_listener *l, int fd,
         char peer_s[64];
         format_peer(peer, peer_s, sizeof peer_s);
         (void)close(fd);
+        pd_count(w, li, refused);
         pd_log_reject(l, lc->name, peer_s, refused, now);
         return;
     }
@@ -571,6 +614,7 @@ void pd_conn_accept(struct pd_worker *w, struct pd_listener *l, int fd,
         pd_log_msg(PD_LOG_WARN, "out of memory for a new connection");
         return;
     }
+    pd_stat_add(w, li, PD_ST_ACCEPTED, 1);
     memcpy(c->key, key, sizeof c->key);
     c->keylen = (uint8_t)keylen;
     c->held = held;

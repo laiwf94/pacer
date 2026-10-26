@@ -58,6 +58,10 @@ int tcp_connect(uint16_t port);
 /* Same, from a chosen loopback source address such as "127.0.0.2". */
 int tcp_connect_from(uint16_t port, const char *src);
 
+/* Run pacerctl with the given arguments; output (stdout and stderr) goes to
+ * out. Returns its exit code, or -1. */
+int run_ctl(char *out, size_t outlen, const char *const *args);
+
 /* When positive, the next spawned pacerd gets this RLIMIT_NOFILE. */
 extern int harness_nofile;
 

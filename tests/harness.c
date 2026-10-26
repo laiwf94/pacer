@@ -256,3 +256,45 @@ int tcp_connect_from(uint16_t port, const char *src)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;
 }
+
+int run_ctl(char *out, size_t outlen, const char *const *args)
+{
+    const char *bin = getenv("PACERCTL_BIN"); // NOLINT(concurrency-mt-unsafe): env is never written
+    if (!bin) {
+        bin = "build/asan/pacerctl";
+    }
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+        return -1;
+    }
+    char *argv[16];
+    int argc = 0;
+    argv[argc++] = strdup(bin);
+    for (int i = 0; args[i] && argc < 15; i++) {
+        argv[argc++] = strdup(args[i]);
+    }
+    argv[argc] = NULL;
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(pipefd[1], 1);
+        dup2(pipefd[1], 2);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    for (int i = 0; i < argc; i++) {
+        free(argv[i]);
+    }
+    close(pipefd[1]);
+    size_t len = 0;
+    ssize_t r = 0;
+    while (len + 1 < outlen && (r = read(pipefd[0], out + len, outlen - 1 - len)) > 0) {
+        len += (size_t)r;
+    }
+    out[len] = '\0';
+    close(pipefd[0]);
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid) {
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}

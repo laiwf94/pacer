@@ -99,6 +99,7 @@ static void shed_connection(struct pd_worker *w, struct pd_listener *l, uint64_t
         int fd = accept4(l->h.fd, NULL, NULL, SOCK_CLOEXEC);
         if (fd >= 0) {
             (void)close(fd);
+            pd_count(w, l->index, "fd_exhausted");
             pd_log_reject(l, name, "-", "fd_exhausted", now);
         }
         w->reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -106,6 +107,7 @@ static void shed_connection(struct pd_worker *w, struct pd_listener *l, uint64_t
     if (w->reserve_fd < 0) {
         listeners_off(w);
         w->accept_paused_to = now + ACCEPT_PAUSE_NS;
+        pd_count(w, l->index, "fd_exhausted_paused");
         pd_log_reject(l, name, "-", "fd_exhausted_paused", now);
     }
 }
