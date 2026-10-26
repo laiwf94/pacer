@@ -31,7 +31,7 @@ endif
 
 # The event loop needs epoll, signalfd and eventfd; elsewhere only the
 # library, the portable parts of the daemon and the unit tests are built.
-LINUX_SRC := src/pacerd/daemon.c src/pacerd/worker.c
+LINUX_SRC := src/pacerd/daemon.c src/pacerd/worker.c src/pacerd/proxy.c
 LIB_SRC   := $(wildcard src/lib/*.c)
 PD_ALL    := $(filter-out src/pacerd/main.c,$(wildcard src/pacerd/*.c))
 ifeq ($(UNAME),Linux)
@@ -42,7 +42,7 @@ else
   BINS    :=
 endif
 TEST_SRC  := $(wildcard tests/test_*.c) tests/test_main.c
-IT_SRC    := $(wildcard tests/it_*.c) tests/harness.c tests/test_main.c
+IT_SRC    := $(wildcard tests/it_*.c) tests/harness.c tests/upstream.c tests/test_main.c
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/%.o)
 PD_OBJ    := $(PD_SRC:%.c=$(BUILD)/%.o)
 TEST_OBJ  := $(sort $(TEST_SRC:%.c=$(BUILD)/%.o))

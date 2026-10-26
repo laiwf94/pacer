@@ -1,0 +1,383 @@
+/*
+ * Connection handling: accept, upstream connect, and moving bytes in both
+ * directions through one fixed buffer each.
+ *
+ * Interest is level-triggered and recomputed after every event. A fd with
+ * nothing to wait for is removed from epoll entirely, so a peer that has
+ * hung up cannot make the loop spin on EPOLLHUP while the other direction
+ * drains.
+ *
+ * Inner functions never free the connection. They return NULL to carry on
+ * or a short reason, and the event entry points close with that reason.
+ */
+#include "pacerd/daemon.h"
+#include "pacerd/log.h"
+#include "pacerd/util.h"
+
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+struct pd_conn *pd_conn_of_handle(struct pd_handle *h)
+{
+    size_t off = h->kind == PD_H_CLIENT ? offsetof(struct pd_conn, client)
+                                        : offsetof(struct pd_conn, upstream);
+    return (struct pd_conn *)((char *)h - off);
+}
+
+struct pd_conn *pd_conn_of_timer(struct pd_timer *t)
+{
+    return (struct pd_conn *)((char *)t - offsetof(struct pd_conn, timer));
+}
+
+static const struct pd_listener_conf *lconf(const struct pd_conn *c)
+{
+    return &c->w->cfg->c.listeners[c->li];
+}
+
+static uint32_t buf_space(const struct pd_buf *b)
+{
+    return b->cap - b->end + b->start;
+}
+
+static uint32_t buf_used(const struct pd_buf *b)
+{
+    return b->end - b->start;
+}
+
+/* Source and destination fds of a direction. */
+static int src_fd(const struct pd_conn *c, int dir)
+{
+    return dir == PD_UP ? c->client.fd : c->upstream.fd;
+}
+
+static int dst_fd(const struct pd_conn *c, int dir)
+{
+    return dir == PD_UP ? c->upstream.fd : c->client.fd;
+}
+
+static const char *set_interest(struct pd_conn *c, int side, uint32_t mask)
+{
+    struct pd_handle *h = side == 0 ? &c->client : &c->upstream;
+    uint32_t cur = c->mask[side];
+    if (mask == cur) {
+        return NULL;
+    }
+    struct epoll_event ev = {.events = mask, .data.ptr = h};
+    int op = EPOLL_CTL_MOD;
+    if (cur == 0) {
+        op = EPOLL_CTL_ADD;
+    } else if (mask == 0) {
+        op = EPOLL_CTL_DEL;
+    }
+    if (epoll_ctl(c->w->epfd, op, h->fd, &ev) != 0) {
+        /* Only kernel memory exhaustion gets here; drop the connection
+         * rather than leave it deaf. */
+        return "epoll_error";
+    }
+    c->mask[side] = mask;
+    return NULL;
+}
+
+/* Recompute what each fd waits for. */
+static const char *update(struct pd_conn *c)
+{
+    uint32_t cm = 0, um = 0;
+    if (!c->eof[PD_UP] && buf_space(&c->buf[PD_UP]) > 0) {
+        cm |= EPOLLIN;
+    }
+    if (buf_used(&c->buf[PD_DOWN]) > 0) {
+        cm |= EPOLLOUT;
+    }
+    if (c->connecting) {
+        um = EPOLLOUT;
+    } else {
+        if (!c->eof[PD_DOWN] && buf_space(&c->buf[PD_DOWN]) > 0) {
+            um |= EPOLLIN;
+        }
+        if (buf_used(&c->buf[PD_UP]) > 0) {
+            um |= EPOLLOUT;
+        }
+    }
+    const char *why = set_interest(c, 0, cm);
+    return why ? why : set_interest(c, 1, um);
+}
+
+static const char *reset_reason(int dir_of_fd, int err)
+{
+    if (err == ECONNRESET || err == EPIPE) {
+        return dir_of_fd == PD_UP ? "client_reset" : "upstream_reset";
+    }
+    return dir_of_fd == PD_UP ? "client_error" : "upstream_error";
+}
+
+/* Write what the buffer holds for `dir` to its destination. */
+static const char *flush(struct pd_conn *c, int dir)
+{
+    struct pd_buf *b = &c->buf[dir];
+    if (dir == PD_UP && c->connecting) {
+        return NULL;
+    }
+    while (b->start < b->end) {
+        ssize_t n = send(dst_fd(c, dir), b->data + b->start, b->end - b->start, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                return NULL;
+            }
+            return reset_reason(dir == PD_UP ? PD_DOWN : PD_UP, errno);
+        }
+        b->start += (uint32_t)n;
+    }
+    b->start = b->end = 0;
+    if (c->eof[dir] && !c->shut[dir]) {
+        /* Pass the FIN on once everything before it has been written. */
+        (void)shutdown(dst_fd(c, dir), SHUT_WR);
+        c->shut[dir] = 1;
+    }
+    return NULL;
+}
+
+/* Read from the source of `dir` into its buffer, then try to write it on. */
+static const char *pump(struct pd_conn *c, int dir)
+{
+    struct pd_buf *b = &c->buf[dir];
+    if (b->end == b->cap && b->start > 0) {
+        memmove(b->data, b->data + b->start, b->end - b->start);
+        b->end -= b->start;
+        b->start = 0;
+    }
+    uint32_t want = b->cap - b->end;
+    if (want == 0 || c->eof[dir]) {
+        return NULL;
+    }
+    ssize_t n = recv(src_fd(c, dir), b->data + b->end, want, 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EINTR) {
+            return NULL;
+        }
+        return reset_reason(dir, errno);
+    }
+    if (n == 0) {
+        c->eof[dir] = 1;
+    } else {
+        b->end += (uint32_t)n;
+        c->bytes[dir] += (uint64_t)n;
+    }
+    return flush(c, dir);
+}
+
+static int finished(const struct pd_conn *c)
+{
+    return c->shut[PD_UP] && c->shut[PD_DOWN];
+}
+
+/* Queue the connection's earliest deadline. A connection that cannot get
+ * a timer slot is closed: it could otherwise wait forever. */
+static const char *arm_timer(struct pd_conn *c)
+{
+    if (c->connecting) {
+        if (pd_heap_set(&c->w->timers, &c->timer, c->connect_deadline) != 0) {
+            return "out_of_memory";
+        }
+    } else {
+        pd_heap_remove(&c->w->timers, &c->timer);
+    }
+    return NULL;
+}
+
+static const char *finish_connect(struct pd_conn *c)
+{
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(c->upstream.fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+        err = errno;
+    }
+    if (err == EINPROGRESS) {
+        return NULL;
+    }
+    if (err != 0) {
+        return err == ECONNREFUSED ? "upstream_refused" : "upstream_unreachable";
+    }
+    c->connecting = 0;
+    const char *why = arm_timer(c);
+    return why ? why : flush(c, PD_UP);
+}
+
+static const char *handle_event(struct pd_conn *c, struct pd_handle *h, uint32_t events)
+{
+    const char *why = NULL;
+    if (h->kind == PD_H_UPSTREAM && c->connecting) {
+        return finish_connect(c);
+    }
+    int in_dir = h->kind == PD_H_CLIENT ? PD_UP : PD_DOWN;
+    int out_dir = in_dir == PD_UP ? PD_DOWN : PD_UP;
+    /* Errors and hang-ups surface through the read or write that follows. */
+    if (events & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
+        why = pump(c, in_dir);
+    }
+    if (!why && (events & (EPOLLOUT | EPOLLERR | EPOLLHUP))) {
+        why = flush(c, out_dir);
+    }
+    return why;
+}
+
+static void after(struct pd_conn *c, const char *why)
+{
+    if (!why && finished(c)) {
+        why = "done";
+    }
+    if (!why) {
+        why = update(c);
+    }
+    if (why) {
+        pd_conn_close(c, why);
+    }
+}
+
+void pd_conn_event(struct pd_conn *c, struct pd_handle *h, uint32_t events, uint64_t now)
+{
+    (void)now;
+    if (c->closed) {
+        return;
+    }
+    after(c, handle_event(c, h, events));
+}
+
+void pd_conn_timer(struct pd_conn *c, uint64_t now)
+{
+    if (c->connecting && c->connect_deadline <= now) {
+        pd_conn_close(c, "connect_timeout");
+        return;
+    }
+    after(c, NULL);
+}
+
+void pd_conn_close(struct pd_conn *c, const char *reason)
+{
+    struct pd_worker *w = c->w;
+    struct pd_log_line l;
+    pd_log_begin(&l, PD_LOG_INFO, "conn closed");
+    pd_log_u64(&l, "conn", c->id);
+    pd_log_str(&l, "listener", lconf(c)->name);
+    pd_log_str(&l, "peer", c->peer);
+    pd_log_str(&l, "reason", reason);
+    pd_log_u64(&l, "bytes_up", c->bytes[PD_UP]);
+    pd_log_u64(&l, "bytes_down", c->bytes[PD_DOWN]);
+    pd_log_u64(&l, "ms", (pacer_now_ns() - c->start_ns) / 1000000);
+    pd_log_end(&l);
+
+    pd_heap_remove(&w->timers, &c->timer);
+    /* Closing a fd removes it from epoll. */
+    (void)close(c->client.fd);
+    if (c->upstream.fd >= 0) {
+        (void)close(c->upstream.fd);
+    }
+    if (c->prev) {
+        c->prev->next = c->next;
+    } else {
+        w->conns = c->next;
+    }
+    if (c->next) {
+        c->next->prev = c->prev;
+    }
+    w->nconns--;
+    c->closed = 1;
+    c->next = w->dead;
+    w->dead = c;
+}
+
+void pd_conn_reap(struct pd_worker *w)
+{
+    while (w->dead) {
+        struct pd_conn *c = w->dead;
+        w->dead = c->next;
+        free(c->buf[PD_UP].data);
+        free(c);
+    }
+}
+
+static void format_peer(const struct sockaddr_storage *ss, char *buf, size_t len)
+{
+    struct pd_addr a;
+    memset(&a, 0, sizeof a);
+    memcpy(&a.ss, ss, sizeof *ss);
+    pd_addr_format(&a, buf, len);
+}
+
+static void nodelay(int fd)
+{
+    int one = 1;
+    /* Small writes are forwarded as they come; Nagle would add latency on
+     * top of the peer's own. Failure only costs latency. */
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+}
+
+/* Start the upstream connect. Returns NULL or a close reason. */
+static const char *connect_upstream(struct pd_conn *c, uint64_t now)
+{
+    const struct pd_listener_conf *lc = lconf(c);
+    int fd = socket(lc->upstream.ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return "upstream_socket";
+    }
+    c->upstream.fd = fd;
+    nodelay(fd);
+    c->connecting = 1;
+    c->connect_deadline = now + lc->connect_timeout_ns;
+    if (connect(fd, (const struct sockaddr *)&lc->upstream.ss, lc->upstream.len) != 0 &&
+        errno != EINPROGRESS) {
+        return errno == ECONNREFUSED ? "upstream_refused" : "upstream_unreachable";
+    }
+    return arm_timer(c);
+}
+
+void pd_conn_accept(struct pd_worker *w, uint32_t li, int fd, const struct sockaddr_storage *peer)
+{
+    const struct pd_listener_conf *lc = &w->cfg->c.listeners[li];
+    struct pd_conn *c = calloc(1, sizeof *c);
+    char *mem = malloc((size_t)lc->buffer_size * 2);
+    if (!c || !mem) {
+        free(c);
+        free(mem);
+        (void)close(fd);
+        pd_log_msg(PD_LOG_WARN, "out of memory for a new connection");
+        return;
+    }
+    uint64_t now = pacer_now_ns();
+    c->w = w;
+    c->li = li;
+    c->id = pd_next_conn_id();
+    c->start_ns = now;
+    c->client.kind = PD_H_CLIENT;
+    c->client.fd = fd;
+    c->upstream.kind = PD_H_UPSTREAM;
+    c->upstream.fd = -1;
+    for (int d = 0; d < 2; d++) {
+        c->buf[d].data = mem + (size_t)d * lc->buffer_size;
+        c->buf[d].cap = lc->buffer_size;
+    }
+    format_peer(peer, c->peer, sizeof c->peer);
+    nodelay(fd);
+    c->next = w->conns;
+    if (w->conns) {
+        w->conns->prev = c;
+    }
+    w->conns = c;
+    w->nconns++;
+
+    struct pd_log_line l;
+    pd_log_begin(&l, PD_LOG_DEBUG, "conn open");
+    pd_log_u64(&l, "conn", c->id);
+    pd_log_str(&l, "listener", lc->name);
+    pd_log_str(&l, "peer", c->peer);
+    pd_log_end(&l);
+
+    const char *why = connect_upstream(c, now);
+    after(c, why);
+}

@@ -28,3 +28,6 @@ Checks: >
   -readability-avoid-unconditional-preprocessor-if
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/(include|src|tests|bench|fuzz)/.*'
+CheckOptions:
+  # An explicit (void) cast is how we mark a result that is ignored on purpose.
+  bugprone-unused-return-value.AllowCastToVoid: true
