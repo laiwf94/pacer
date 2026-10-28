@@ -153,10 +153,10 @@ typedef struct pacer_table pacer_table;
  * What to do when a new key arrives and its shard is full. The table first
  * reclaims an idle entry (one whose bucket has refilled and that has no
  * holds, which is identical to a fresh entry, so dropping it changes no
- * decision). If none of the least recently used entries is idle:
+ * decision). If none of the eight least recently used entries is idle:
  *   PACER_FULL_DENY refuses the new key and keeps everyone's debt;
- *   PACER_FULL_EVICT drops the least recently used entry without holds,
- *   and its debt. Entries with holds are never dropped.
+ *   PACER_FULL_EVICT drops the least recently used of those eight that has
+ *   no holds, and its debt. Entries with holds are never dropped.
  * DENY is the safe default against an attacker spraying source addresses:
  * EVICT would let them reset other clients' limits.
  */
