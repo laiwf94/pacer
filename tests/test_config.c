@@ -257,6 +257,8 @@ TEST(config_hostile_input)
     /* Control bytes from the file never reach the message. */
     expect_error("\x1b[31mevil 1\n", "unknown directive \"?[31mevil\"");
     expect_error("listener a {\nmax_conns \"7\n", "got \"?7\"");
+    /* Bytes above 0x7f are replaced too, whether char is signed or not. */
+    expect_error("\xc3\xa9vil\xff 1\n", "unknown directive \"??vil?\"");
     /* Long tokens are cut short in messages. */
     expect_error("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1\n",
                  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...");

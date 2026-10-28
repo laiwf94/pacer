@@ -47,7 +47,11 @@ static const char *shown(const char *tok, char *buf, size_t len)
     size_t i = 0;
     for (; tok[i] && i + 4 < len; i++) {
         unsigned char c = (unsigned char)tok[i];
-        buf[i] = (c >= 0x20 && c < 0x7f && c != '"') ? (char)c : '?';
+        if (c >= 0x20 && c < 0x7f && c != '"') {
+            buf[i] = tok[i];
+        } else {
+            buf[i] = '?';
+        }
     }
     if (tok[i]) {
         buf[i++] = '.';
