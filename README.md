@@ -1,5 +1,7 @@
 # pacer
 
+> **This project has moved.** pacer is now part of [laiwf94/edgefront](https://github.com/laiwf94/edgefront), where it lives under `legacy/pacer/` with its full history while it is ported to Rust. This repository is archived.
+
 pacer is a rate limiter written in C17 with no dependencies beyond libc. libpacer is the library: a GCRA token bucket whose whole state is one word updated with a lock-free compare-and-swap, a sharded per-key table with fixed memory and idle eviction, and a sliding-window counter. pacerd is a TCP proxy built on it that limits each client address and each listener by connections, new connections per second and bytes per second, cuts off slowloris clients, and drains without losing bytes in flight.
 
 The design, its trade-offs and the sources it draws on are in [docs/DESIGN.md](docs/DESIGN.md).
