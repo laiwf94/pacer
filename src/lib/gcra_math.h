@@ -89,16 +89,20 @@ static inline uint64_t pacer_step_range(uint64_t tat, uint64_t now, uint64_t min
     return grant;
 }
 
-/* Arrival time after giving back `tokens`. Never moves before now, so a
- * refund cannot create more than a full bucket. */
-static inline uint64_t pacer_step_refund(uint64_t tat, uint64_t now, uint64_t tokens, uint64_t iv,
-                                         uint64_t tol)
+/*
+ * Arrival time after giving back `tokens`. Never moves before now, so a
+ * refund cannot create more than a full bucket. The debt can exceed the
+ * tolerance after a reconfigure shrinks the burst, so a refund is measured
+ * against the debt, not capped at one burst. When tokens <= debt / iv,
+ * tokens * iv <= debt and cannot overflow.
+ */
+static inline uint64_t pacer_step_refund(uint64_t tat, uint64_t now, uint64_t tokens, uint64_t iv)
 {
     if (tat <= now) {
         return tat;
     }
-    uint64_t back = tokens > tol / iv ? tol : tokens * iv;
-    return tat - now > back ? tat - back : now;
+    uint64_t debt = tat - now;
+    return tokens > debt / iv ? now : tat - tokens * iv;
 }
 
 #endif

@@ -431,7 +431,7 @@ void pacer_table_refund(pacer_table *t, const void *key, size_t len, uint64_t no
     (void)pthread_mutex_lock(&s->mu);
     struct entry *e = &s->slots[probe(s, hash, key, len)];
     if (e->keylen != 0) {
-        e->tat = pacer_step_refund(e->tat, now, tokens, iv, tol);
+        e->tat = pacer_step_refund(e->tat, now, tokens, iv);
     }
     (void)pthread_mutex_unlock(&s->mu);
 }

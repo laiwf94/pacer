@@ -147,6 +147,23 @@ TEST(table_delete_keeps_probe_chains_intact)
     pacer_table_destroy(t);
 }
 
+TEST(table_refund_after_a_shrink_gives_back_every_token)
+{
+    /* 10 tokens of debt at 10/s is 1 s; then the burst shrinks to 1.
+     * Refunding 6 tokens leaves 400 ms of debt, so the next token is 400 ms
+     * away. A refund capped at one burst would leave it 900 ms away. */
+    pacer_table *t = make_table(100, 0, 100);
+    pacer_decision d;
+    CHECK_EQ_INT(pacer_table_take_upto(t, "k", 1, SEC, 10, &d), PACER_OK);
+    CHECK_EQ_U64(d.granted, 10);
+    pacer_rate small = {10, SEC, 1};
+    CHECK_EQ_INT(pacer_table_reconfigure(t, &small), PACER_OK);
+    pacer_table_refund(t, "k", 1, SEC, 6);
+    CHECK_EQ_INT(pacer_table_take(t, "k", 1, SEC, 1, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, 4 * SEC / 10);
+    pacer_table_destroy(t);
+}
+
 TEST(table_take_upto_and_refund)
 {
     pacer_table *t = make_table(100, 0, 100);

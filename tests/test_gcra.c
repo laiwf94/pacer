@@ -236,6 +236,26 @@ TEST(gcra_reconfigure_keeps_debt_in_time)
     CHECK_EQ_INT(pacer_gcra_reconfigure(&g, &bad), PACER_EINVAL);
 }
 
+TEST(gcra_refund_after_a_shrink_gives_back_every_token)
+{
+    /* 100 tokens of debt at 1 ms each, then the burst shrinks to 10: the
+     * debt stays 100 ms, 90 tokens more than the new bucket holds. */
+    pacer_gcra g;
+    pacer_rate big = {1000, SEC, 100};
+    pacer_gcra_init(&g, &big);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 100, NULL), 100);
+    pacer_rate small = {1000, SEC, 10};
+    CHECK_EQ_INT(pacer_gcra_reconfigure(&g, &small), PACER_OK);
+    /* Giving back 50 leaves 50 ms of debt, so one token is 41 ms away. A
+     * refund capped at one burst would leave it 81 ms away. */
+    pacer_gcra_refund(&g, SEC, 50);
+    pacer_decision d;
+    CHECK_EQ_INT(pacer_gcra_take(&g, SEC, 1, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, 41 * MS);
+    pacer_gcra_refund(&g, SEC, UINT64_MAX);
+    CHECK_EQ_U64(pacer_gcra_remaining(&g, SEC), 10);
+}
+
 TEST(gcra_take_range_waits_for_the_minimum)
 {
     pacer_gcra g;
