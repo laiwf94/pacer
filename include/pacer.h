@@ -93,8 +93,9 @@ int pacer_gcra_init(pacer_gcra *g, const pacer_rate *r);
 /*
  * Take `cost` tokens at `now_ns`, all or nothing. Returns 1 when granted, 0
  * when denied (state unchanged, d->retry_after_ns says when the same cost
- * would fit), or PACER_ERANGE when cost exceeds the burst. A cost of 0 is
- * always granted and only reports `remaining`. `d` may be NULL.
+ * would fit), or PACER_ERANGE when cost exceeds the burst. A cost of 0
+ * takes nothing and only reports `remaining`; it is granted unless a
+ * reconfigure has left more debt than the new burst. `d` may be NULL.
  */
 int pacer_gcra_take(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decision *d);
 

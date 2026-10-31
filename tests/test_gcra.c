@@ -104,6 +104,22 @@ TEST(gcra_zero_cost_reports_without_taking)
     CHECK_EQ_U64(pacer_gcra_remaining(&g, SEC), 5);
 }
 
+TEST(gcra_zero_cost_is_denied_while_debt_exceeds_the_burst)
+{
+    pacer_gcra g;
+    pacer_rate big = {1000, SEC, 100};
+    pacer_gcra_init(&g, &big);
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 100, NULL), 100);
+    pacer_rate small = {1000, SEC, 10};
+    CHECK_EQ_INT(pacer_gcra_reconfigure(&g, &small), PACER_OK);
+    /* 100 ms of debt against a 10 ms bucket: 90 ms until the level is 0. */
+    pacer_decision d;
+    CHECK_EQ_INT(pacer_gcra_take(&g, SEC, 0, &d), 0);
+    CHECK_EQ_U64(d.retry_after_ns, 90 * MS);
+    CHECK_EQ_INT(pacer_gcra_take(&g, SEC + 90 * MS, 0, &d), 1);
+    CHECK_EQ_U64(d.remaining, 0);
+}
+
 TEST(gcra_remaining_refills_over_time)
 {
     pacer_gcra g;

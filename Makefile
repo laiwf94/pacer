@@ -53,7 +53,7 @@ else
   PD_SRC  := $(filter-out $(LINUX_SRC),$(PD_ALL))
   BINS    :=
 endif
-TEST_SRC  := $(wildcard tests/test_*.c) tests/test_main.c
+TEST_SRC  := $(wildcard tests/test_*.c tests/model_*.c) tests/test_main.c
 IT_SRC    := $(wildcard tests/it_*.c) tests/harness.c tests/upstream.c tests/test_main.c
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/%.o)
 PD_OBJ    := $(PD_SRC:%.c=$(BUILD)/%.o)
